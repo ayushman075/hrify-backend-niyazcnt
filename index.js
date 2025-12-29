@@ -11,7 +11,7 @@ dotenv.config({
 });
 
 app.use(cors({
-  origin:['http://localhost:5174','http://localhost:8081','https://iridescent-parfait-9b7d28.netlify.app','*','http://localhost:5173','https://hrify-frontend-plum.vercel.app','https://hrify-frontend-crvwhg7b2-ayushman075s-projects.vercel.app'],
+  origin:['http://localhost:5174','http://localhost:8081','https://iridescent-parfait-9b7d28.netlify.app','*','http://localhost:5173','https://hrify-frontend-plum.vercel.app','https://hrify-frontend-crvwhg7b2-ayushman075s-projects.vercel.app','https://hrify-niyazcnt.vercel.app'],
   credentials:true,
  methods:['GET','POST','DELETE','PUT','PATCH'],
  
