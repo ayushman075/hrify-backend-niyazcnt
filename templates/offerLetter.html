@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Letter of Intent</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      margin: 40px;
+      line-height: 1.8;
+      color: #000;
+    }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 2px solid #f0f0f0;
+      padding-bottom: 10px;
+      margin-bottom: 20px;
+    }
+    .header img {
+      width: 150px;
+    }
+    .company-info {
+      text-align: right;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+    .date {
+      text-align: right;
+      margin-bottom: 30px;
+    }
+    .to-section {
+      white-space: pre-line;
+      margin-bottom: 30px;
+    }
+    .letter-title {
+      text-align: center;
+      font-size: 20px;
+      font-weight: bold;
+      text-decoration: underline;
+      margin-bottom: 30px;
+    }
+    .content {
+      font-size: 14px;
+    }
+    .content p {
+      margin: 15px 0;
+    }
+    .content ul {
+      padding-left: 20px;
+    }
+    .signature-section {
+      margin-top: 40px;
+    }
+    .signature-section p {
+      margin: 8px 0;
+    }
+    .footer {
+      margin-top: 40px;
+      text-align: center;
+      font-size: 0.8em;
+      color: #888;
+      border-top: 1px solid #e0e0e0;
+      padding-top: 10px;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="header">
+    <img src="data:image/png;base64,{{base64Logo}}" alt="Company Logo">
+    <div class="company-info">
+      <p><strong>{{companyName}}</strong></p>
+      <p>Address: {{companyAddress}}</p>
+      <p>Website: {{companyWebsite}}</p>
+      <p>Contact No: {{companyContact}}</p>
+      <p>Email: {{companyEmail}}</p>
+      <p>Company ID: {{companyID}}</p>
+    </div>
+  </div>
+
+  <div class="date">
+    <p><strong>Date: {{generationDate}}</strong></p>
+  </div>
+
+  <div class="to-section">
+To,
+{{candidateName}},
+  </div>
+
+  <div class="letter-title">LETTER OF INTENT</div>
+
+  <br class="content">
+    <p>Dear {{candidateName}},</p>
+
+    <p>Thank you for meeting us to pursue an employment opportunity with our company.</p>
+
+    <p>Based on your Curriculum Vitae and the interview held on {{interviewDate}} in our Hospital, we are pleased to offer you an appointment on the remuneration as offered and agreed by you. </p>
+  
+    <p>Department: {{department}}</p>
+    <p>Work Location: {{workLocation}}</p>
+   
+
+
+
+    <p>The management reserves the right to utilize your services in any of our group Hospitals located elsewhere in India either in existence or which may come into existence in future. Your initial place of posting will be at BIMS Hospital, Balangir.</p>
+
+    <p>This is a non binding letter of intent merely expressing an intention to enter into a contract.</p>
+
+    <p>The appointment offer is subjected to:</p>
+    <ul>
+      <li>The information provided by you in your Curriculum Vitae and interviews are correct and valid.</li>
+    </ul>
+
+    <p>You would be further intimated as and when hospital starts with its operations. Your appointment shall be valid from the date of joining.</p>
+<br></br>
+    <p>Your formal appointment letter will be issued at the time of your joining. In the meantime, we request your confirmation of acceptance of this offer by returning us a signed copy of this letter on or before {{acceptanceDeadline}}.</p>
+
+    <p>Please bring the following documents at the time of your joining:</p>
+    <ul>
+      <li>Original and self attested photo copies of all your educational documents (matriculation onward).</li>
+      <li>Experience certificates.</li>
+      <li>Relieving certificate from your last employer, if any.</li>
+      <li>Proof of your last salary, if applicable.</li>
+      <li>Two passport size recent colour photographs.</li>
+      <li>Proof of your residence.</li>
+      <li>Copy of your PAN card and Aadhar card.</li>
+    </ul>
+
+    <p>You will be required to report your joining formalities with</p>
+    <p><strong>Human Resources Manager Office,<br>
+    BIMS Hospital,<br>
+    At: Gandhinagar Pada, Jail Road,<br>
+    Balangir, Odisha, 767001</strong></p>
+
+    <div class="signature-section">
+      <p>Thanking You,</p>
+      <p>For BIMS Hospital</p>
+      <br><br>
+      <p><strong>Authorised Signatory</strong></p>
+    </div>
+  </div>
+
+  <div class="footer">
+    <p>This is a computer-generated document. No signature is required.</p>
+    <p>Generated on {{generationDate}}</p>
+  </div>
+
+</body>
+</html>
