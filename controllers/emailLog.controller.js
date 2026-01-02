@@ -1,10 +1,17 @@
-
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { asyncHandler } from "../utils/AsyncHandler.js";
 import EmailTemplate from "../models/emailTemplate.model.js";
 import { EmailLog } from "../models/emailLog.model.js";
 import { User } from "../models/user.model.js";
 import { emailQueue } from "../db/redis.config.js";
+import { getCache, setCache, removeCache, removeCachePattern } from "../utils/cache.js";
+
+// Cache Keys Configuration
+const CACHE_KEY = {
+  PREFIX: "email_log_",          // Single ID: email_log_12345
+  LIST_PREFIX: "email_log_list_",// Query lists
+  STATS: "email_stats_"          // Statistics: email_stats_week
+};
 
 const sendTemplateEmail = asyncHandler(async (req, res) => {
     const { templateId, to, variables, priority } = req.body;
@@ -30,7 +37,6 @@ const sendTemplateEmail = asyncHandler(async (req, res) => {
     if (!template) {
       return res.status(404).json(new ApiResponse(404, {}, "Email template not found", false));
     }
-    
     
     // Verify that all required variables are provided
     const templateVars = template.variables || [];
@@ -94,6 +100,12 @@ const sendTemplateEmail = asyncHandler(async (req, res) => {
       
       await emailQueue.add('email', requestOption, jobOptions);
       
+      // [CACHE INVALIDATION]
+      // 1. New log created -> Lists are stale
+      await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+      // 2. Stats (counts) changed -> Stats are stale
+      await removeCachePattern(`${CACHE_KEY.STATS}*`);
+
       return res.status(200).json(
         new ApiResponse(200, { emailId: emailLog._id }, "Email queued successfully")
       );
@@ -105,12 +117,12 @@ const sendTemplateEmail = asyncHandler(async (req, res) => {
         new ApiResponse(500, {}, `Failed to queue email: ${error.message}`, false)
       );
     }
-  });
+});
   
   /**
    * Controller to get email logs with advanced filtering and pagination
    */
-  const getEmailLogs = asyncHandler(async (req, res) => {
+const getEmailLogs = asyncHandler(async (req, res) => {
     const {
       page = 1,
       limit = 20,
@@ -128,12 +140,20 @@ const sendTemplateEmail = asyncHandler(async (req, res) => {
       return res.status(401).json(new ApiResponse(401, {}, "Unauthorized Request", false));
     }
   
+    // [CACHE READ] Create unique key based on all query filters
+    // We stringify req.query to catch every combination of filters
+    const filterKey = JSON.stringify(req.query);
+    const cacheKey = `${CACHE_KEY.LIST_PREFIX}${filterKey}`;
+    
+    const cachedData = await getCache(cacheKey);
+    if (cachedData) {
+        return res.status(200).json(new ApiResponse(200, cachedData, "Email logs fetched from Cache!"));
+    }
+
     const user = await User.findOne({ userId });
     if (!user) {
       return res.status(404).json(new ApiResponse(404, {}, "User not found", false));
     }
-  
-
   
     // Build filter conditions
     const query = {};
@@ -178,25 +198,37 @@ const sendTemplateEmail = asyncHandler(async (req, res) => {
   
     const totalLogs = await EmailLog.countDocuments(query);
   
-    return res.status(200).json(new ApiResponse(200, {
-      totalLogs,
-      totalPages: Math.ceil(totalLogs / parseInt(limit)),
-      currentPage: parseInt(page),
-      logs,
-    }, "Email logs fetched successfully!"));
-  });
+    const responsePayload = {
+        totalLogs,
+        totalPages: Math.ceil(totalLogs / parseInt(limit)),
+        currentPage: parseInt(page),
+        logs,
+    };
+
+    // [CACHE WRITE]
+    await setCache(cacheKey, responsePayload, 3600);
+
+    return res.status(200).json(new ApiResponse(200, responsePayload, "Email logs fetched successfully!"));
+});
   
   /**
    * Controller to get details of a specific email
    */
-  const getEmailDetails = asyncHandler(async (req, res) => {
+const getEmailDetails = asyncHandler(async (req, res) => {
     const { emailId } = req.params;
+    const cacheKey = `${CACHE_KEY.PREFIX}${emailId}`;
     
     const userId = req.auth.userId;
     if (!userId) {
       return res.status(401).json(new ApiResponse(401, {}, "Unauthorized Request", false));
     }
   
+    // [CACHE READ]
+    const cachedLog = await getCache(cacheKey);
+    if (cachedLog) {
+        return res.status(200).json(new ApiResponse(200, cachedLog, "Email details fetched from Cache!"));
+    }
+
     const user = await User.findOne({ userId });
     if (!user) {
       return res.status(404).json(new ApiResponse(404, {}, "User not found", false));
@@ -210,21 +242,29 @@ const sendTemplateEmail = asyncHandler(async (req, res) => {
       return res.status(404).json(new ApiResponse(404, {}, "Email not found", false));
     }
   
-
+    // [CACHE WRITE]
+    await setCache(cacheKey, email, 3600);
   
     return res.status(200).json(new ApiResponse(200, email, "Email details fetched successfully!"));
-  });
+});
   
   
   /**
    * Controller to get email statistics
    */
-  const getEmailStats = asyncHandler(async (req, res) => {
+const getEmailStats = asyncHandler(async (req, res) => {
     const { period = 'week' } = req.query;
+    const cacheKey = `${CACHE_KEY.STATS}${period}`;
     
     const userId = req.auth.userId;
     if (!userId) {
       return res.status(401).json(new ApiResponse(401, {}, "Unauthorized Request", false));
+    }
+
+    // [CACHE READ] Stats are expensive to calculate (Aggregation), so caching is important here
+    const cachedStats = await getCache(cacheKey);
+    if (cachedStats) {
+        return res.status(200).json(new ApiResponse(200, cachedStats, "Email statistics fetched from Cache!"));
     }
   
     const user = await User.findOne({ userId });
@@ -300,9 +340,12 @@ const sendTemplateEmail = asyncHandler(async (req, res) => {
       topTemplates: templateStats,
       dailyStats: formattedDailyStats
     };
+
+    // [CACHE WRITE]
+    await setCache(cacheKey, stats, 3600);
   
     return res.status(200).json(new ApiResponse(200, stats, "Email statistics fetched successfully!"));
-  });
+});
   
   // Export controllers
 export {
@@ -310,4 +353,4 @@ export {
     getEmailLogs,
     getEmailDetails,
     getEmailStats
-  };
+};

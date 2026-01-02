@@ -1,9 +1,16 @@
 import { asyncHandler } from "../utils/AsyncHandler.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
-import {Employee} from "../models/employee.model.js"
+import { Employee } from "../models/employee.model.js";
 import { uploadFileOnCloudinary } from "../utils/cloudinary.js";
-import fs from "fs"
+import fs from "fs";
+import { getCache, setCache, removeCache, removeCachePattern } from "../utils/cache.js";
 
+// Cache Keys Configuration
+const CACHE_KEY = {
+  PREFIX: "employee_",         // Single items: employee_12345
+  LIST_PREFIX: "employee_list_", // Query lists: employee_list_page1_...
+  BIRTHDAY_LIST: "employee_birthdays_today" // Special key for birthday list
+};
 
 const createEmployee = asyncHandler(async (req, res) => {
     const { 
@@ -32,20 +39,21 @@ const createEmployee = asyncHandler(async (req, res) => {
         emergencyContact, bankAccountDetails, nominationDetails, generalInformation
     });
 
-    // If creation fails
     if (!employee) {
         return res.status(500).json(new ApiResponse(500, {}, 'Failed to create employee.'));
     }
 
-    // Respond with the created employee data
+    // [CACHE INVALIDATION]
+    // 1. Clear general lists
+    await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+    // 2. Clear birthday list (in case new employee has birthday today)
+    await removeCache(CACHE_KEY.BIRTHDAY_LIST);
+
     res.status(201).json(new ApiResponse(201, employee, 'Employee created successfully.'));
 });
 
-
 export const uploadEmployeeSignature = asyncHandler(async (req,res)=>{
   const imageLocalPath = req.file?.path;
-
-   
   let images;
   
  if(imageLocalPath){
@@ -66,8 +74,6 @@ export const uploadEmployeeSignature = asyncHandler(async (req,res)=>{
 
 export const uploadEmployeePhoto = asyncHandler(async (req,res)=>{
   const imageLocalPath = req.file?.path;
-
-   
   let images;
   
  if(imageLocalPath){
@@ -94,6 +100,15 @@ const getAllEmployees = asyncHandler(async (req, res) => {
       filters = {},
     } = req.query;
   
+    // [CACHE READ] Unique key based on query params
+    const filterKey = JSON.stringify(filters);
+    const cacheKey = `${CACHE_KEY.LIST_PREFIX}p${page}_l${limit}_s${sort}_o${order}_f${filterKey}`;
+    
+    const cachedData = await getCache(cacheKey);
+    if (cachedData) {
+        return res.status(200).json(new ApiResponse(200, cachedData, "Employees retrieved from Cache!", true));
+    }
+
     const query = {};
   
     // Apply filters
@@ -109,7 +124,6 @@ const getAllEmployees = asyncHandler(async (req, res) => {
     if (filters.contactNo) {
       query.contactNo = { $regex: filters.contactNo, $options: "i" };
     }
-
     if (filters.gender) {
       query.gender = filters.gender;
     }
@@ -147,37 +161,46 @@ const getAllEmployees = asyncHandler(async (req, res) => {
   
     const totalEmployees = await Employee.countDocuments(query);
   
-    return res.status(200).json(
-      new ApiResponse(
-        200,
-        {
+    const responsePayload = {
           success: true,
           totalEmployees,
           totalPages: Math.ceil(totalEmployees / limit),
           currentPage: parseInt(page),
           employees,
-        },
-        "Employees retrieved successfully!",
-        true
-      )
-    );
-  });
-  
+    };
 
+    // [CACHE WRITE]
+    await setCache(cacheKey, responsePayload, 3600);
+
+    return res.status(200).json(
+      new ApiResponse(200, responsePayload, "Employees retrieved successfully!", true)
+    );
+});
+  
 const getEmployeeById = asyncHandler(async (req, res) => {
     const employeeId = req.params.id;
     if(!employeeId){
         return res.status(409).json(new ApiResponse(409,{},"Employee ID is required."))
     }
+
+    // [CACHE READ]
+    const cacheKey = `${CACHE_KEY.PREFIX}${employeeId}`;
+    const cachedEmployee = await getCache(cacheKey);
+    if (cachedEmployee) {
+        return res.status(200).json(new ApiResponse(200, cachedEmployee, 'Employee retrieved from Cache.'));
+    }
+
     const employee = await Employee.findById(employeeId);
 
     if (!employee) {
         return res.status(404).json(new ApiResponse(404, {}, 'Employee not found.'));
     }
 
+    // [CACHE WRITE]
+    await setCache(cacheKey, employee, 3600);
+
     res.status(200).json(new ApiResponse(200, employee, 'Employee retrieved successfully.'));
 });
-
 
 const updateEmployee = asyncHandler(async (req, res) => {
     const { 
@@ -211,6 +234,14 @@ const updateEmployee = asyncHandler(async (req, res) => {
         return res.status(404).json(new ApiResponse(404, {}, 'Employee not found.'));
     }
 
+    // [CACHE INVALIDATION]
+    // 1. Clear specific employee cache
+    await removeCache(`${CACHE_KEY.PREFIX}${req.params.id}`);
+    // 2. Clear all list caches
+    await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+    // 3. Clear birthday list (dates might have changed)
+    await removeCache(CACHE_KEY.BIRTHDAY_LIST);
+
     res.status(200).json(new ApiResponse(200, updatedEmployee, 'Employee updated successfully.'));
 });
 
@@ -221,26 +252,44 @@ const deleteEmployee = asyncHandler(async (req, res) => {
         return res.status(404).json(new ApiResponse(404, {}, 'Employee not found.'));
     }
 
+    // [CACHE INVALIDATION]
+    // 1. Clear specific employee cache
+    await removeCache(`${CACHE_KEY.PREFIX}${req.params.id}`);
+    // 2. Clear all list caches
+    await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+    // 3. Clear birthday list
+    await removeCache(CACHE_KEY.BIRTHDAY_LIST);
+
     res.status(200).json(new ApiResponse(200, {}, 'Employee deleted successfully.'));
 });
 
 const getEmployeesWithBirthdayToday = asyncHandler(async (req, res) => {
-  const today = new Date();
-  const todayMonth = today.getMonth() + 1; // Months are 0-indexed
-  const todayDay = today.getDate();
+    // [CACHE READ] Check for birthday cache
+    const cachedBirthdays = await getCache(CACHE_KEY.BIRTHDAY_LIST);
+    if (cachedBirthdays) {
+        return res.status(200).json(new ApiResponse(200, cachedBirthdays, "Employees with birthdays today (Cache)!"));
+    }
 
-  const employees = await Employee.find({
-      $expr: {
-          $and: [
-              { $eq: [{ $month: "$dateOfBirth" }, todayMonth] },
-              { $eq: [{ $dayOfMonth: "$dateOfBirth" }, todayDay] }
-          ]
-      }
-  }).populate("post","title");
+    const today = new Date();
+    const todayMonth = today.getMonth() + 1; 
+    const todayDay = today.getDate();
 
-  return res.status(200).json(
-      new ApiResponse(200, employees, "Employees with birthdays today retrieved successfully!")
-  );
+    const employees = await Employee.find({
+        $expr: {
+            $and: [
+                { $eq: [{ $month: "$dateOfBirth" }, todayMonth] },
+                { $eq: [{ $dayOfMonth: "$dateOfBirth" }, todayDay] }
+            ]
+        }
+    }).populate("post","title");
+
+    // [CACHE WRITE] Save for 12 hours (43200 seconds) so it refreshes next day
+    // Note: Invalidated on any CREATE/UPDATE/DELETE action to ensure accuracy
+    await setCache(CACHE_KEY.BIRTHDAY_LIST, employees, 43200);
+
+    return res.status(200).json(
+        new ApiResponse(200, employees, "Employees with birthdays today retrieved successfully!")
+    );
 });
 
 

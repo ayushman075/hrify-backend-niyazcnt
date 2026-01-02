@@ -2,6 +2,13 @@ import { Holiday } from "../models/holidays.model.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { asyncHandler } from "../utils/AsyncHandler.js";
 import { User } from "../models/user.model.js";
+import { getCache, setCache, removeCache, removeCachePattern } from "../utils/cache.js";
+
+// Cache Keys Configuration
+const CACHE_KEY = {
+  PREFIX: "holiday_",           // Single ID: holiday_12345
+  LIST_PREFIX: "holiday_list_"  // Query lists
+};
 
 // Create a new holiday
 export const createHoliday = asyncHandler(async (req, res) => {
@@ -45,6 +52,9 @@ export const createHoliday = asyncHandler(async (req, res) => {
 
   await holiday.save();
 
+  // [CACHE INVALIDATION] New holiday -> Clear all lists (calendars need update)
+  await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+
   return res
     .status(201)
     .json(new ApiResponse(201, holiday, "Holiday created successfully", true));
@@ -55,8 +65,7 @@ export const updateHoliday = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const { name, description, date,  type,  isActive } = req.body;
   const userId = req.auth.userId;
-  const month = `${new Date(date).getFullYear()}-${String(new Date(date).getMonth() + 1).padStart(2, '0')}`;
-
+  
   // Validate user authorization
   const user = await User.findOne({ userId });
   if (!user || !(user.role === 'Admin' || user.role === 'HR Manager')) {
@@ -75,12 +84,20 @@ export const updateHoliday = asyncHandler(async (req, res) => {
   // Update fields if provided
   if (name) holiday.name = name;
   if (description) holiday.description = description;
-  if (date) holiday.date = new Date(date);
-  if (month) holiday.month = month;
+  if (date) {
+    holiday.date = new Date(date);
+    holiday.month = `${new Date(date).getFullYear()}-${String(new Date(date).getMonth() + 1).padStart(2, '0')}`;
+  }
   if (type) holiday.type = type;
   if (typeof isActive === 'boolean') holiday.isActive = isActive;
 
   const updatedHoliday = await holiday.save();
+
+  // [CACHE INVALIDATION]
+  // 1. Clear specific holiday cache
+  await removeCache(`${CACHE_KEY.PREFIX}${id}`);
+  // 2. Clear all list caches (dates/active status changed)
+  await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
 
   return res
     .status(200)
@@ -109,6 +126,10 @@ export const deleteHoliday = asyncHandler(async (req, res) => {
 
   await Holiday.findByIdAndDelete(id);
 
+  // [CACHE INVALIDATION]
+  await removeCache(`${CACHE_KEY.PREFIX}${id}`);
+  await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+
   return res
     .status(200)
     .json(new ApiResponse(200, {}, "Holiday deleted successfully", true));
@@ -117,6 +138,13 @@ export const deleteHoliday = asyncHandler(async (req, res) => {
 // Get a single holiday by ID
 export const getHolidayById = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  const cacheKey = `${CACHE_KEY.PREFIX}${id}`;
+
+  // [CACHE READ]
+  const cachedHoliday = await getCache(cacheKey);
+  if (cachedHoliday) {
+      return res.status(200).json(new ApiResponse(200, cachedHoliday, "Holiday retrieved from Cache", true));
+  }
 
   const holiday = await Holiday.findById(id);
   if (!holiday) {
@@ -124,6 +152,9 @@ export const getHolidayById = asyncHandler(async (req, res) => {
       .status(404)
       .json(new ApiResponse(404, {}, "Holiday not found", false));
   }
+
+  // [CACHE WRITE]
+  await setCache(cacheKey, holiday, 86400); // 24 hours TTL (holidays don't change often)
 
   return res
     .status(200)
@@ -142,6 +173,16 @@ export const getAllHolidays = asyncHandler(async (req, res) => {
     year,
     isActive
   } = req.query;
+
+  // [CACHE READ] Unique key based on all filters
+  // Stringify req.query ensures distinct caches for different months/years
+  const filterKey = JSON.stringify(req.query);
+  const cacheKey = `${CACHE_KEY.LIST_PREFIX}${filterKey}`;
+  
+  const cachedData = await getCache(cacheKey);
+  if (cachedData) {
+      return res.status(200).json(new ApiResponse(200, cachedData, "Holidays retrieved from Cache", true));
+  }
 
   const pageNumber = parseInt(page, 1);
   const pageLimit = parseInt(limit, 10);
@@ -163,15 +204,20 @@ export const getAllHolidays = asyncHandler(async (req, res) => {
   const totalHolidays = await Holiday.countDocuments(filterConditions);
   const totalPages = Math.ceil(totalHolidays / pageLimit);
 
+  const responsePayload = {
+      holidays,
+      totalPages,
+      currentPage: pageNumber,
+      totalHolidays
+  };
+
+  // [CACHE WRITE] Save for 24 hours
+  await setCache(cacheKey, responsePayload, 86400);
+
   return res.status(200).json(
     new ApiResponse(
       200,
-      {
-        holidays,
-        totalPages,
-        currentPage: pageNumber,
-        totalHolidays
-      },
+      responsePayload,
       "Holidays retrieved successfully",
       true
     )

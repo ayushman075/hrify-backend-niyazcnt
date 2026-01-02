@@ -2,6 +2,13 @@ import { asyncHandler } from "../utils/AsyncHandler.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { Notice } from "../models/notice.model.js";
 import { User } from "../models/user.model.js";
+import { getCache, setCache, removeCache, removeCachePattern } from "../utils/cache.js";
+
+// Cache Keys Configuration
+const CACHE_KEY = {
+  PREFIX: "notice_",           // Single ID: notice_12345
+  LIST_PREFIX: "notice_list_"  // Query lists
+};
 
 const createNotice = asyncHandler(async (req, res) => {
   const {
@@ -46,6 +53,9 @@ const createNotice = asyncHandler(async (req, res) => {
     createdBy: user._id,
   });
 
+  // [CACHE INVALIDATION] New notice added -> Lists are stale
+  await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+
   return res
     .status(201)
     .json(new ApiResponse(201, notice, "Notice created successfully!"));
@@ -59,6 +69,16 @@ const getAllNotices = asyncHandler(async (req, res) => {
     order = "desc",
     filters = {},
   } = req.query;
+
+  // [CACHE READ] Create unique key based on all query params
+  // Stringifying filters ensures distinct caches for "HR" vs "IT" notices, etc.
+  const filterKey = JSON.stringify(filters);
+  const cacheKey = `${CACHE_KEY.LIST_PREFIX}p${page}_l${limit}_s${sort}_o${order}_f${filterKey}`;
+  
+  const cachedData = await getCache(cacheKey);
+  if (cachedData) {
+      return res.status(200).json(new ApiResponse(200, cachedData, "Notices fetched from Cache"));
+  }
 
   const query = {};
   if (filters.title) {
@@ -92,23 +112,40 @@ const getAllNotices = asyncHandler(async (req, res) => {
 
   const totalNotices = await Notice.countDocuments(query);
 
-  return res.status(200).json(new ApiResponse(200, {
-    success: true,
-    totalNotices,
-    totalPages: Math.ceil(totalNotices / limit),
-    currentPage: page,
-    notices,
-  }, "Notices fetched successfully"));
+  const responsePayload = {
+      success: true,
+      totalNotices,
+      totalPages: Math.ceil(totalNotices / limit),
+      currentPage: parseInt(page),
+      notices,
+  };
+
+  // [CACHE WRITE] Save for 1 hour
+  await setCache(cacheKey, responsePayload, 3600);
+
+  return res.status(200).json(new ApiResponse(200, responsePayload, "Notices fetched successfully"));
 });
 
 const getNotice = asyncHandler(async (req, res) => {
-  const notice = await Notice.findById(req.params.id)
+  const { id } = req.params;
+  const cacheKey = `${CACHE_KEY.PREFIX}${id}`;
+
+  // [CACHE READ]
+  const cachedNotice = await getCache(cacheKey);
+  if (cachedNotice) {
+      return res.status(200).json(new ApiResponse(200, cachedNotice, "Notice retrieved from Cache!"));
+  }
+
+  const notice = await Notice.findById(id)
     .populate("createdBy", "fullName")
     .populate("department", "name");
 
   if (!notice) {
     return res.status(404).json(new ApiResponse(404, {}, "Notice not found!"));
   }
+
+  // [CACHE WRITE]
+  await setCache(cacheKey, notice, 3600);
 
   return res
     .status(200)
@@ -164,6 +201,12 @@ const updateNotice = asyncHandler(async (req, res) => {
 
   await notice.save();
 
+  // [CACHE INVALIDATION]
+  // 1. Clear specific notice cache
+  await removeCache(`${CACHE_KEY.PREFIX}${req.params.id}`);
+  // 2. Clear all list caches
+  await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+
   return res
     .status(200)
     .json(new ApiResponse(200, notice, "Notice updated successfully!"));
@@ -193,6 +236,10 @@ const toggleNoticeStatus = asyncHandler(async (req, res) => {
   
   await notice.save();
 
+  // [CACHE INVALIDATION]
+  await removeCache(`${CACHE_KEY.PREFIX}${req.params.id}`);
+  await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+
   return res
     .status(200)
     .json(new ApiResponse(200, notice, `Notice ${notice.isActive ? 'activated' : 'deactivated'} successfully!`));
@@ -217,6 +264,10 @@ const deleteNotice = asyncHandler(async (req, res) => {
   }
 
   await Notice.findByIdAndDelete(req.params.id);
+
+  // [CACHE INVALIDATION]
+  await removeCache(`${CACHE_KEY.PREFIX}${req.params.id}`);
+  await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
 
   return res
     .status(200)

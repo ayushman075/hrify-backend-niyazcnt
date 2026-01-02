@@ -2,6 +2,13 @@ import { asyncHandler } from "../utils/AsyncHandler.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { Department } from "../models/department.model.js";
 import { User } from "../models/user.model.js";
+import { getCache, setCache, removeCache, removeCachePattern } from "../utils/cache.js";
+
+// Cache Keys Configuration
+const CACHE_KEY = {
+  PREFIX: "dept_",
+  LIST_PREFIX: "dept_list_"
+};
 
 const createDepartment = asyncHandler(async (req, res) => {
   const { name, description } = req.body;
@@ -12,7 +19,7 @@ const createDepartment = asyncHandler(async (req, res) => {
   }
 
   const user = await User.findOne({ userId });
-  if (!user ) {
+  if (!user) {
     return res.status(401).json(new ApiResponse(401, {}, "Only Admin can create departments", false));
   }
 
@@ -32,6 +39,9 @@ const createDepartment = asyncHandler(async (req, res) => {
     createdBy: user._id,
   });
 
+  // [CACHE INVALIDATION] New data added, clear all lists
+  await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+
   return res.status(201).json(new ApiResponse(201, department, "Department created successfully!"));
 });
 
@@ -43,6 +53,14 @@ const getAllDepartments = asyncHandler(async (req, res) => {
     order = "asc",
     search = ""
   } = req.query;
+
+  // [CACHE READ] Create a unique key based on query parameters
+  const cacheKey = `${CACHE_KEY.LIST_PREFIX}p${page}_l${limit}_s${sort}_o${order}_q${search}`;
+  const cachedData = await getCache(cacheKey);
+
+  if (cachedData) {
+    return res.status(200).json(new ApiResponse(200, cachedData, "Departments fetched from Cache"));
+  }
 
   const query = {};
   if (search) {
@@ -57,30 +75,47 @@ const getAllDepartments = asyncHandler(async (req, res) => {
 
   const totalDepartments = await Department.countDocuments(query);
 
-  return res.status(200).json(new ApiResponse(200, {
+  const responsePayload = {
     success: true,
     totalDepartments,
     totalPages: Math.ceil(totalDepartments / limit),
     currentPage: parseInt(page),
     departments,
-  }, "Departments fetched successfully"));
+  };
+
+  // [CACHE WRITE] Save result for 1 hour
+  await setCache(cacheKey, responsePayload, 3600);
+
+  return res.status(200).json(new ApiResponse(200, responsePayload, "Departments fetched successfully"));
 });
 
 const getDepartment = asyncHandler(async (req, res) => {
-  const department = await Department.findById(req.params.id)
+  const departmentId = req.params.id;
+  const cacheKey = `${CACHE_KEY.PREFIX}${departmentId}`;
+
+  // [CACHE READ]
+  const cachedDepartment = await getCache(cacheKey);
+  if (cachedDepartment) {
+    return res.status(200).json(new ApiResponse(200, cachedDepartment, "Department retrieved from Cache!"));
+  }
+
+  const department = await Department.findById(departmentId)
     .populate("createdBy", "fullName");
 
   if (!department) {
     return res.status(404).json(new ApiResponse(404, {}, "Department not found!"));
   }
 
+  // [CACHE WRITE]
+  await setCache(cacheKey, department, 3600);
+
   return res.status(200).json(new ApiResponse(200, department, "Department retrieved successfully!"));
 });
 
 const updateDepartment = asyncHandler(async (req, res) => {
   const { name, description } = req.body;
-
   const userId = req.auth.userId;
+
   if (!userId) {
     return res.status(401).json(new ApiResponse(401, {}, "Unauthorized Request", false));
   }
@@ -98,7 +133,7 @@ const updateDepartment = asyncHandler(async (req, res) => {
 
   // If name is being updated, check for duplicates
   if (name && name !== department.name) {
-    const existingDepartment = await Department.findOne({ 
+    const existingDepartment = await Department.findOne({
       name: { $regex: new RegExp(`^${name}$`, 'i') },
       _id: { $ne: department._id }
     });
@@ -111,6 +146,12 @@ const updateDepartment = asyncHandler(async (req, res) => {
   department.description = description || department.description;
 
   await department.save();
+
+  // [CACHE INVALIDATION]
+  // 1. Remove the specific department cache (so next fetch gets new data)
+  await removeCache(`${CACHE_KEY.PREFIX}${req.params.id}`);
+  // 2. Remove list caches (because names/descriptions changed, affecting search/lists)
+  await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
 
   return res.status(200).json(new ApiResponse(200, department, "Department updated successfully!"));
 });
@@ -130,6 +171,12 @@ const deleteDepartment = asyncHandler(async (req, res) => {
   }
 
   await department.deleteOne();
+
+  // [CACHE INVALIDATION]
+  // 1. Remove the specific department cache
+  await removeCache(`${CACHE_KEY.PREFIX}${req.params.id}`);
+  // 2. Remove list caches (because total count changed)
+  await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
 
   return res.status(200).json(new ApiResponse(200, {}, "Department deleted successfully!"));
 });

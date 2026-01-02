@@ -6,8 +6,18 @@ import { AdvancePaymentConfig } from '../models/advancedPaymentConfig.model.js';
 import { AdvancePayment } from '../models/advancedPayment.model.js';
 import { User } from '../models/user.model.js';
 import dayjs from 'dayjs';
+import { getCache, setCache, removeCache, removeCachePattern } from "../utils/cache.js";
+
+// Cache Keys Configuration
+const CACHE_KEY = {
+  CONFIG: "adv_pay_config",          // Single key for configuration
+  PREFIX: "adv_pay_rec_",            // Single record: adv_pay_rec_123
+  LIST_PREFIX: "adv_pay_list_"       // Query lists
+};
 
 // --- HELPER: Validate Eligibility & Calculate Amount ---
+// NOTE: This function deliberately queries the DATABASE directly (not cache)
+// to ensure financial calculations are always based on the absolute latest data.
 const validateAdvanceEligibility = async (employeeId, amountRequested) => {
   // 1. Check Configuration
   const config = await AdvancePaymentConfig.findOne();
@@ -46,10 +56,6 @@ const validateAdvanceEligibility = async (employeeId, amountRequested) => {
   
   const totalAmountTaken = existingAdvances.reduce((sum, record) => sum + record.amount, 0);
 
-  // Check Frequency Limit
-  // Note: If we are approving a pending request, it isn't counted in 'existingAdvances' yet, 
-  // so (approvedAdvancesCount + 1) would be the new count.
-  // However, usually frequency limits apply to *how many times you can take it*.
   if (approvedAdvancesCount >= config.maxAdvanceFrequency) {
     return { 
       isValid: false, 
@@ -63,7 +69,6 @@ const validateAdvanceEligibility = async (employeeId, amountRequested) => {
   const monthlyGross = employee.post?.salary?.gross || 0;
 
   if (config.allowWorkingDaysOnly) {
-    // Logic: (Gross / 30) * Present Days
     const attendanceRecords = await Attendance.find({
       employeeId: employee._id,
       month: currentMonth
@@ -79,11 +84,9 @@ const validateAdvanceEligibility = async (employeeId, amountRequested) => {
     const dailyRate = monthlyGross / 30;
     maxPolicyLimit = dailyRate * presentDays;
   } else {
-    // Logic: Percentage of Monthly Gross
     maxPolicyLimit = (monthlyGross * config.maxAdvancePercentage) / 100;
   }
 
-  // Round Policy Limit
   maxPolicyLimit = Math.round((maxPolicyLimit + Number.EPSILON) * 100) / 100;
 
   // 5. Final Amount Check (Cumulative)
@@ -93,16 +96,11 @@ const validateAdvanceEligibility = async (employeeId, amountRequested) => {
     const remainingLimit = Math.max(0, maxPolicyLimit - totalAmountTaken);
     return { 
       isValid: false, 
-      message: `Limit Exceeded. 
-        Total Eligible: ₹${maxPolicyLimit}. 
-        Already Taken: ₹${totalAmountTaken}. 
-        Requesting ₹${amountRequested} would exceed the limit. 
-        Remaining eligible amount: ₹${remainingLimit}.`, 
+      message: `Limit Exceeded. Total Eligible: ₹${maxPolicyLimit}. Already Taken: ₹${totalAmountTaken}. Requesting ₹${amountRequested} would exceed the limit. Remaining eligible amount: ₹${remainingLimit}.`, 
       statusCode: 400 
     };
   }
 
-  // Success
   return { 
     isValid: true, 
     data: { employee, maxEligibleAmount: maxPolicyLimit, currentMonth } 
@@ -136,6 +134,9 @@ const updateAdvanceConfig = asyncHandler(async (req, res) => {
     { upsert: true, new: true }
   );
 
+  // [CACHE INVALIDATION] Config changed, clear the cache
+  await removeCache(CACHE_KEY.CONFIG);
+
   return res.status(200).json(
     new ApiResponse(200, config, "Advance payment configuration updated", true)
   );
@@ -143,7 +144,17 @@ const updateAdvanceConfig = asyncHandler(async (req, res) => {
 
 // 2. Get Config
 const getAdvanceConfig = asyncHandler(async (req, res) => {
+  // [CACHE READ]
+  const cachedConfig = await getCache(CACHE_KEY.CONFIG);
+  if (cachedConfig) {
+      return res.status(200).json(new ApiResponse(200, cachedConfig, "Advance payment configuration retrieved (Cache)", true));
+  }
+
   const config = await AdvancePaymentConfig.findOne();
+  
+  // [CACHE WRITE] Save indefinitely (or long time) until updated
+  await setCache(CACHE_KEY.CONFIG, config, 86400);
+
   return res.status(200).json(
     new ApiResponse(200, config, "Advance payment configuration retrieved", true)
   );
@@ -179,6 +190,9 @@ const applyForAdvance = asyncHandler(async (req, res) => {
     requestedBy: userId
   });
 
+  // [CACHE INVALIDATION] New request added -> Lists are stale
+  await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+
   return res.status(201).json(
     new ApiResponse(201, advancePayment, "Advance payment request submitted successfully", true)
   );
@@ -205,12 +219,7 @@ const updateAdvanceStatus = asyncHandler(async (req, res) => {
   }
 
   // --- CRITICAL RE-VALIDATION ---
-  // If approving, we must check if (Current Approved Total + This Request) <= Limit
   if (status === 'approved' && advancePayment.status !== 'approved') {
-    // Note: The logic inside validateAdvanceEligibility sums up 'approved'/'paid' requests.
-    // Since this request is currently 'pending', it won't be in that sum yet.
-    // So logic works perfectly: (Sum of Approved) + (This Pending Request Amount) vs Limit.
-    
     const validation = await validateAdvanceEligibility(advancePayment.employeeId, advancePayment.amount);
     
     if (!validation.isValid) {
@@ -232,6 +241,10 @@ const updateAdvanceStatus = asyncHandler(async (req, res) => {
     { new: true }
   );
 
+  // [CACHE INVALIDATION]
+  await removeCache(`${CACHE_KEY.PREFIX}${id}`);
+  await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+
   return res.status(200).json(
     new ApiResponse(200, updatedRequest, `Advance payment request ${status}`, true)
   );
@@ -240,6 +253,13 @@ const updateAdvanceStatus = asyncHandler(async (req, res) => {
 // 5. Get Single Record
 const getAdvanceById = asyncHandler(async (req, res) => {
   const { id } = req.params;
+  const cacheKey = `${CACHE_KEY.PREFIX}${id}`;
+
+  // [CACHE READ]
+  const cachedRecord = await getCache(cacheKey);
+  if (cachedRecord) {
+      return res.status(200).json(new ApiResponse(200, cachedRecord, "Record retrieved from Cache", true));
+  }
 
   const advancePayment = await AdvancePayment.findById(id)
     .populate('employeeId', 'employeeId firstName lastName')
@@ -250,6 +270,9 @@ const getAdvanceById = asyncHandler(async (req, res) => {
       new ApiResponse(404, null, "Advance payment record not found", false)
     );
   }
+
+  // [CACHE WRITE]
+  await setCache(cacheKey, advancePayment, 3600);
 
   return res.status(200).json(
     new ApiResponse(200, advancePayment, "Record retrieved", true)
@@ -268,6 +291,15 @@ const getAdvanceRecords = asyncHandler(async (req, res) => {
     limit = 10
   } = req.query;
 
+  // [CACHE READ]
+  const filterKey = JSON.stringify({ month, status, employeeId }); // Create unique key based on filters
+  const cacheKey = `${CACHE_KEY.LIST_PREFIX}p${page}_l${limit}_s${sort}_o${order}_f${filterKey}`;
+  
+  const cachedData = await getCache(cacheKey);
+  if (cachedData) {
+      return res.status(200).json(new ApiResponse(200, cachedData, "Advance payment records (Cache)", true));
+  }
+
   const query = {};
   if (month) query.month = month;
   if (status) query.status = status;
@@ -285,13 +317,18 @@ const getAdvanceRecords = asyncHandler(async (req, res) => {
 
   const total = await AdvancePayment.countDocuments(query);
 
-  return res.status(200).json(
-    new ApiResponse(200, {
+  const responsePayload = {
       advances,
       totalPages: Math.ceil(total / limitNum),
       currentPage: pageNum,
       total
-    }, "Advance payment records retrieved", true)
+  };
+
+  // [CACHE WRITE]
+  await setCache(cacheKey, responsePayload, 3600);
+
+  return res.status(200).json(
+    new ApiResponse(200, responsePayload, "Advance payment records retrieved", true)
   );
 });
 
@@ -313,6 +350,10 @@ const deleteAdvanceRequest = asyncHandler(async (req, res) => {
   }
 
   await AdvancePayment.findByIdAndDelete(id);
+
+  // [CACHE INVALIDATION]
+  await removeCache(`${CACHE_KEY.PREFIX}${id}`);
+  await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
 
   return res.status(200).json(
     new ApiResponse(200, null, "Request deleted successfully", true)

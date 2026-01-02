@@ -6,7 +6,13 @@ import { pdfGenerationQueue } from '../db/redis.config.js';
 import PDFLog from '../models/pdfGeneration.model.js';
 import { Payroll } from '../models/payroll.model.js';
 import { asyncHandler } from '../utils/AsyncHandler.js';
+import { getCache, setCache } from "../utils/cache.js";
 
+// Cache Keys Configuration
+const CACHE_KEY = {
+  PREFIX: "pdf_log_",           // Single ID: pdf_log_12345
+  LIST_PREFIX: "pdf_log_list_"  // Query lists
+};
 
 const generateOfferLetter = asyncHandler(async (req, res) => {
   const { candidateId } = req.params;
@@ -196,10 +202,8 @@ const generatePayrollSlip = asyncHandler(async (req, res) => {
       );
     }
     
-    // Calculate net salary in words (you'll need to implement this function)
     const netSalaryInWords = convertNumberToWords(payroll.netSalary);
     
-    // Prepare data for PDF generation
     const payrollData = {
       employeeId: employee.employeeId,
       employeeName: employee.firstName + " " + employee.middleName + " " + employee.lastName,
@@ -233,9 +237,7 @@ const generatePayrollSlip = asyncHandler(async (req, res) => {
     );
   });
   
-  // Helper function to convert number to words (implement according to your needs)
   function convertNumberToWords(amount) {
-    // This is a simplified version - you might want to use a more comprehensive library
     const ones = ['', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine'];
     const tens = ['', '', 'Twenty', 'Thirty', 'Forty', 'Fifty', 'Sixty', 'Seventy', 'Eighty', 'Ninety'];
     const teens = ['Ten', 'Eleven', 'Twelve', 'Thirteen', 'Fourteen', 'Fifteen', 'Sixteen', 'Seventeen', 'Eighteen', 'Nineteen'];
@@ -273,13 +275,20 @@ const getAllPDFLogs = asyncHandler(async (req, res) => {
       employeeName 
     } = req.query;
     
+    // [CACHE READ] Unique key based on all filters
+    const filterKey = JSON.stringify(req.query);
+    const cacheKey = `${CACHE_KEY.LIST_PREFIX}${filterKey}`;
+    const cachedData = await getCache(cacheKey);
+    if (cachedData) {
+        return res.status(200).json(new ApiResponse(200, cachedData, "PDF logs fetched from Cache"));
+    }
+
     const options = {
       page: parseInt(page),
       limit: parseInt(limit),
       sort: { createdAt: -1 }
     };
     
-    // Build query filter
     const filter = {};
     
     if (documentType) {
@@ -302,7 +311,6 @@ const getAllPDFLogs = asyncHandler(async (req, res) => {
       }
     }
     
-    // Execute query
     const pdfLogs = await PDFLog.find(filter)
       .sort({ createdAt: -1 })
       .skip((parseInt(page) - 1) * parseInt(limit))
@@ -311,15 +319,20 @@ const getAllPDFLogs = asyncHandler(async (req, res) => {
     const totalDocs = await PDFLog.countDocuments(filter);
     const totalPages = Math.ceil(totalDocs / parseInt(limit));
     
-    return res.status(200).json(
-      new ApiResponse(200, {
+    const responsePayload = {
         logs: pdfLogs,
         totalDocs,
         page: parseInt(page),
         totalPages,
         hasNextPage: parseInt(page) < totalPages,
         hasPrevPage: parseInt(page) > 1
-      }, "PDF logs fetched successfully")
+    };
+
+    // [CACHE WRITE] Save for 5 minutes (Short TTL due to async nature)
+    await setCache(cacheKey, responsePayload, 300);
+
+    return res.status(200).json(
+      new ApiResponse(200, responsePayload, "PDF logs fetched successfully")
     );
   });
 
@@ -328,7 +341,14 @@ const getAllPDFLogs = asyncHandler(async (req, res) => {
 // Get a single PDF by ID
 const getPDFById = asyncHandler(async (req, res) => {
     const { id } = req.params;
+    const cacheKey = `${CACHE_KEY.PREFIX}${id}`;
     
+    // [CACHE READ]
+    const cachedLog = await getCache(cacheKey);
+    if (cachedLog) {
+        return res.status(200).json(new ApiResponse(200, cachedLog, "PDF fetched from Cache"));
+    }
+
     const pdfLog = await PDFLog.findById(id);
     
     if (!pdfLog) {
@@ -337,6 +357,9 @@ const getPDFById = asyncHandler(async (req, res) => {
       );
     }
     
+    // [CACHE WRITE] Save for 1 hour (PDF logs are usually immutable)
+    await setCache(cacheKey, pdfLog, 3600);
+
     return res.status(200).json(
       new ApiResponse(200, pdfLog, "PDF fetched successfully")
     );

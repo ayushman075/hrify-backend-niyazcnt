@@ -1,13 +1,21 @@
 import { asyncHandler } from "../utils/AsyncHandler.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
-
 import moment from "moment";
 import Attendance from "../models/attendance.model.js";
 import { Payroll } from "../models/payroll.model.js";
 import { Leave } from "../models/leave.model.js";
 import { User } from "../models/user.model.js";
 import { AdvancePayment } from "../models/advancedPayment.model.js";
+import { getCache, setCache } from "../utils/cache.js";
 
+// Cache Keys Configuration
+const CACHE_KEY = {
+  HR_STATS: "dash_hr_stats",             // Global HR Stats
+  EMP_STATS: "dash_emp_stats_",          // Employee specific: dash_emp_stats_123
+  HR_DETAIL_ATT: "dash_det_att_",        // Detailed lists...
+  HR_DETAIL_PAY: "dash_det_pay_",
+  HR_DETAIL_LEAVE: "dash_det_leave_"
+};
 
 const getLastMonthString = () => {
   const lastMonth = moment().subtract(1, "month");
@@ -19,6 +27,12 @@ const getCurrentMonthString = () => {
 };
 
 const getHRDashboardStats = asyncHandler(async (req, res) => {
+  // [CACHE READ] Check for global stats
+  const cachedStats = await getCache(CACHE_KEY.HR_STATS);
+  if (cachedStats) {
+      return res.status(200).json(new ApiResponse(200, cachedStats, "HR dashboard statistics fetched from Cache"));
+  }
+
   const lastMonth = getLastMonthString();
   const currentMonth = getCurrentMonthString();
   const today = moment().startOf("day");
@@ -33,14 +47,20 @@ const getHRDashboardStats = asyncHandler(async (req, res) => {
   // 3. Leave Stats
   const leaveStats = await getLeaveStats(today, todayEnd, currentMonth);
 
+  const responsePayload = {
+      attendanceStats,
+      payrollStats,
+      leaveStats,
+  };
+
+  // [CACHE WRITE] Save for 5 minutes (300 seconds)
+  // Dashboards can be slightly eventually consistent to save DB load
+  await setCache(CACHE_KEY.HR_STATS, responsePayload, 300);
+
   return res.status(200).json(
     new ApiResponse(
       200,
-      {
-        attendanceStats,
-        payrollStats,
-        leaveStats,
-      },
+      responsePayload,
       "HR dashboard statistics fetched successfully"
     )
   );
@@ -150,6 +170,13 @@ const getDetailedAttendance = asyncHandler(async (req, res) => {
     search = "",
   } = req.query;
 
+  // [CACHE READ]
+  const cacheKey = `${CACHE_KEY.HR_DETAIL_ATT}p${page}_l${limit}_s${sort}_o${order}_q${search}`;
+  const cachedData = await getCache(cacheKey);
+  if (cachedData) {
+      return res.status(200).json(new ApiResponse(200, cachedData, "Detailed attendance fetched from Cache"));
+  }
+
   const query = { month: lastMonth };
   if (search) {
     // Assume we're searching by employee name through population
@@ -166,16 +193,21 @@ const getDetailedAttendance = asyncHandler(async (req, res) => {
 
   const totalRecords = await Attendance.countDocuments(query);
 
+  const responsePayload = {
+      success: true,
+      totalRecords,
+      totalPages: Math.ceil(totalRecords / limit),
+      currentPage: parseInt(page),
+      attendanceRecords,
+  };
+
+  // [CACHE WRITE] 5 min TTL
+  await setCache(cacheKey, responsePayload, 300);
+
   return res.status(200).json(
     new ApiResponse(
       200,
-      {
-        success: true,
-        totalRecords,
-        totalPages: Math.ceil(totalRecords / limit),
-        currentPage: parseInt(page),
-        attendanceRecords,
-      },
+      responsePayload,
       "Detailed attendance records fetched successfully"
     )
   );
@@ -192,6 +224,13 @@ const getDetailedPayroll = asyncHandler(async (req, res) => {
     search = "",
   } = req.query;
 
+  // [CACHE READ]
+  const cacheKey = `${CACHE_KEY.HR_DETAIL_PAY}p${page}_l${limit}_s${sort}_o${order}_q${search}`;
+  const cachedData = await getCache(cacheKey);
+  if (cachedData) {
+      return res.status(200).json(new ApiResponse(200, cachedData, "Detailed payroll fetched from Cache"));
+  }
+
   const query = { month: lastMonth };
   if (search) {
     query["$or"] = [
@@ -207,16 +246,21 @@ const getDetailedPayroll = asyncHandler(async (req, res) => {
 
   const totalRecords = await Payroll.countDocuments(query);
 
+  const responsePayload = {
+      success: true,
+      totalRecords,
+      totalPages: Math.ceil(totalRecords / limit),
+      currentPage: parseInt(page),
+      payrollRecords,
+  };
+
+  // [CACHE WRITE] 5 min TTL
+  await setCache(cacheKey, responsePayload, 300);
+
   return res.status(200).json(
     new ApiResponse(
       200,
-      {
-        success: true,
-        totalRecords,
-        totalPages: Math.ceil(totalRecords / limit),
-        currentPage: parseInt(page),
-        payrollRecords,
-      },
+      responsePayload,
       "Detailed payroll records fetched successfully"
     )
   );
@@ -234,6 +278,13 @@ const getDetailedLeaves = asyncHandler(async (req, res) => {
     search = "",
     status = "",
   } = req.query;
+
+  // [CACHE READ]
+  const cacheKey = `${CACHE_KEY.HR_DETAIL_LEAVE}p${page}_l${limit}_s${sort}_o${order}_q${search}_st${status}`;
+  const cachedData = await getCache(cacheKey);
+  if (cachedData) {
+      return res.status(200).json(new ApiResponse(200, cachedData, "Detailed leaves fetched from Cache"));
+  }
 
   const query = {
     appliedOn: {
@@ -262,112 +313,126 @@ const getDetailedLeaves = asyncHandler(async (req, res) => {
 
   const totalRecords = await Leave.countDocuments(query);
 
+  const responsePayload = {
+      success: true,
+      totalRecords,
+      totalPages: Math.ceil(totalRecords / limit),
+      currentPage: parseInt(page),
+      leaveRecords,
+  };
+
+  // [CACHE WRITE] 5 min TTL
+  await setCache(cacheKey, responsePayload, 300);
+
   return res.status(200).json(
     new ApiResponse(
       200,
-      {
-        success: true,
-        totalRecords,
-        totalPages: Math.ceil(totalRecords / limit),
-        currentPage: parseInt(page),
-        leaveRecords,
-      },
+      responsePayload,
       "Detailed leave applications fetched successfully"
     )
   );
 });
 
-
-
-
 const getEmployeeDashboardStats = asyncHandler(async (req, res) => {
+    const userId = req.auth.userId;
+    if (!userId) {
+      return res.status(401).json(new ApiResponse(401, {}, "Unauthorized Request", false));
+    }
+  
+    // [CACHE READ] Check for specific employee stats
+    // We use the User ID (or we can resolve Employee ID) for the key
+    const cacheKey = `${CACHE_KEY.EMP_STATS}${userId}`;
+    const cachedStats = await getCache(cacheKey);
+    if (cachedStats) {
+        return res.status(200).json(new ApiResponse(200, cachedStats, "Employee dashboard stats fetched from Cache"));
+    }
+
     const lastMonth = getLastMonthString();
     const currentMonth = getCurrentMonthString();
     const today = moment().startOf("day");
     const todayEnd = moment().endOf("day");
-      const userId = req.auth.userId;
-      if (!userId) {
-        return res.status(401).json(new ApiResponse(401, {}, "Unauthorized Request", false));
-      }
     
-      const user = await User.findOne({ userId });
-      if (!user ) {
-        return res.status(401).json(new ApiResponse(401, {}, "Only Admin can create departments", false));
-      }
+    const user = await User.findOne({ userId });
+    if (!user ) {
+      return res.status(401).json(new ApiResponse(401, {}, "Only Admin can create departments", false));
+    }
 
-      const employeeId = user.employeeId
+    const employeeId = user.employeeId
     
-  
     // Fetch stats
     const attendanceStats = await getEmployeeAttendanceStats(employeeId, lastMonth);
     const payrollStats = await getEmployeePayrollStats(employeeId, lastMonth);
     const leaveStats = await getEmployeeLeaveStats(employeeId, today, todayEnd, currentMonth);
     const advancePayoutStats = await getEmployeeAdvancePayoutStats(employeeId);
   
+    const responsePayload = {
+        attendanceStats,
+        payrollStats,
+        leaveStats,
+        advancePayoutStats,
+    };
+
+    // [CACHE WRITE] 5 min TTL
+    await setCache(cacheKey, responsePayload, 300);
+
     return res.status(200).json(
       new ApiResponse(
         200,
-        {
-          attendanceStats,
-          payrollStats,
-          leaveStats,
-          advancePayoutStats,
-        },
+        responsePayload,
         "Employee dashboard statistics fetched successfully"
       )
     );
-  });
+});
   
-  // Get attendance statistics for the employee
-  async function getEmployeeAttendanceStats(employeeId, lastMonth) {
-    const payroll = await Payroll.findOne({ employee:employeeId, month: lastMonth });
-    return {
-      attendancePercentage: payroll?.attendance?.attendancePercentage?.toFixed(2) || 0,
-    };
-  }
+// Get attendance statistics for the employee
+async function getEmployeeAttendanceStats(employeeId, lastMonth) {
+  const payroll = await Payroll.findOne({ employee:employeeId, month: lastMonth });
+  return {
+    attendancePercentage: payroll?.attendance?.attendancePercentage?.toFixed(2) || 0,
+  };
+}
   
-  // Get payroll statistics for the employee
-  async function getEmployeePayrollStats(employeeId, lastMonth) {
-    const payroll = await Payroll.findOne({ employee: employeeId, month: lastMonth });
-    return {
-      netSalary: payroll?.netSalary || 0,
-      status: payroll?.status || "Not Processed",
-    };
-  }
+// Get payroll statistics for the employee
+async function getEmployeePayrollStats(employeeId, lastMonth) {
+  const payroll = await Payroll.findOne({ employee: employeeId, month: lastMonth });
+  return {
+    netSalary: payroll?.netSalary || 0,
+    status: payroll?.status || "Not Processed",
+  };
+}
   
-  // Get leave statistics for the employee
-  async function getEmployeeLeaveStats(employeeId, today, todayEnd, currentMonth) {
-    const pendingLeaves = await Leave.countDocuments({ employeeId, status: "Pending" });
-    const processedLeaves = await Leave.countDocuments({ employeeId, status: { $in: ["Approved", "Rejected"] } });
+// Get leave statistics for the employee
+async function getEmployeeLeaveStats(employeeId, today, todayEnd, currentMonth) {
+  const pendingLeaves = await Leave.countDocuments({ employeeId, status: "Pending" });
+  const processedLeaves = await Leave.countDocuments({ employeeId, status: { $in: ["Approved", "Rejected"] } });
   
-    const totalLeaves = await Leave.aggregate([
-      { $match: { employeeId, status: "Approved" } },
-      { $group: { _id: null, totalLeavesUsed: { $sum: "$days" } } },
-    ]);
+  const totalLeaves = await Leave.aggregate([
+    { $match: { employeeId, status: "Approved" } },
+    { $group: { _id: null, totalLeavesUsed: { $sum: "$days" } } },
+  ]);
   
-    return {
-      pendingLeaves,
-      processedLeaves,
-      totalLeavesUsed: totalLeaves[0]?.totalLeavesUsed || 0,
-    };
-  }
+  return {
+    pendingLeaves,
+    processedLeaves,
+    totalLeavesUsed: totalLeaves[0]?.totalLeavesUsed || 0,
+  };
+}
   
-  // Get advance payout request statistics
-  async function getEmployeeAdvancePayoutStats(employeeId) {
-    const pendingRequests = await AdvancePayment.countDocuments({ employeeId, status: "Pending" });
-    const processedRequests = await AdvancePayment.countDocuments({ employeeId, status: { $in: ["Approved", "Rejected"] } });
+// Get advance payout request statistics
+async function getEmployeeAdvancePayoutStats(employeeId) {
+  const pendingRequests = await AdvancePayment.countDocuments({ employeeId, status: "Pending" });
+  const processedRequests = await AdvancePayment.countDocuments({ employeeId, status: { $in: ["Approved", "Rejected"] } });
   
-    return {
-      pendingRequests,
-      processedRequests,
-    };
-  }
+  return {
+    pendingRequests,
+    processedRequests,
+  };
+}
   
-
-
-
-
 export {
   getHRDashboardStats,
-  getEmployeeDashboardStats
+  getEmployeeDashboardStats,
+  getDetailedAttendance,
+  getDetailedPayroll,
+  getDetailedLeaves
 };

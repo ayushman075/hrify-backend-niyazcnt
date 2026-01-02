@@ -6,12 +6,19 @@ import { Payroll } from '../models/payroll.model.js';
 import { Holiday } from '../models/holidays.model.js';
 import dayjs from 'dayjs';
 import isoWeek from 'dayjs/plugin/isoWeek.js';
+import { getCache, setCache, removeCache, removeCachePattern } from "../utils/cache.js";
 
 // Extend dayjs with ISO Week plugin for accurate weekly calculations
 dayjs.extend(isoWeek);
 
+// Cache Keys Configuration
+const CACHE_KEY = {
+  PREFIX: "pay_",              // Single ID: pay_12345
+  LIST_PREFIX: "pay_list_"     // Query lists
+};
+
 // ------------------------------------------------------------------
-// --- HELPER FUNCTIONS ---
+// --- HELPER FUNCTIONS (Preserved as is) ---
 // ------------------------------------------------------------------
 
 const getWeekDateRange = (weekId) => {
@@ -53,7 +60,7 @@ const calculateTotalDeductions = (components, taxes) => {
 };
 
 // ------------------------------------------------------------------
-// --- CORE CALCULATION LOGIC ---
+// --- CORE CALCULATION LOGIC (Preserved as is) ---
 // ------------------------------------------------------------------
 
 /**
@@ -323,6 +330,9 @@ const generateMonthlyPayroll = asyncHandler(async (req, res) => {
         }
     }
 
+    // [CACHE INVALIDATION] Data generated -> All payroll query lists are stale
+    await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+
     return res.status(200).json(new ApiResponse(200, results, "Monthly payroll processing completed", true));
 });
 
@@ -392,6 +402,9 @@ const generateWeeklyPayroll = asyncHandler(async (req, res) => {
         }
     }
 
+    // [CACHE INVALIDATION]
+    await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+
     return res.status(200).json(new ApiResponse(200, results, "Weekly payroll processing completed", true));
 });
 
@@ -458,12 +471,25 @@ const processEmployeePayroll = asyncHandler(async (req, res) => {
         { upsert: true, new: true }
     );
 
+    // [CACHE INVALIDATION]
+    // Invalidate lists and, specifically if we could predict the ID, that record. 
+    // Since we did findOneAndUpdate, we can try invalidating the ID if we knew the old one, but clearing lists is safer.
+    await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+
     return res.status(200).json(new ApiResponse(200, payroll, "Payroll processed successfully", true));
 });
 
 // 4. Get Payroll By ID
 const getPayrollById = asyncHandler(async (req, res) => {
     const { id } = req.params;
+    const cacheKey = `${CACHE_KEY.PREFIX}${id}`;
+
+    // [CACHE READ]
+    const cachedData = await getCache(cacheKey);
+    if (cachedData) {
+        return res.status(200).json(new ApiResponse(200, cachedData, "Payroll retrieved from Cache", true));
+    }
+
     const payroll = await Payroll.findById(id)
         .populate('employee', 'employeeId firstName lastName')
         .populate('employee.post', 'title department');
@@ -471,12 +497,25 @@ const getPayrollById = asyncHandler(async (req, res) => {
     if (!payroll) {
         return res.status(404).json(new ApiResponse(404, null, "Payroll record not found", false));
     }
+
+    // [CACHE WRITE]
+    await setCache(cacheKey, payroll, 3600);
+
     return res.status(200).json(new ApiResponse(200, payroll, "Payroll retrieved successfully", true));
 });
 
 // 5. Get Filtered Payroll
 const getFilteredPayroll = asyncHandler(async (req, res) => {
     const { month, employeeId, status, sort = "createdAt", order = "desc", page = 1, limit = 10 } = req.query;
+
+    // [CACHE READ]
+    const filterKey = JSON.stringify(req.query);
+    const cacheKey = `${CACHE_KEY.LIST_PREFIX}p${page}_l${limit}_s${sort}_o${order}_f${filterKey}`;
+    
+    const cachedData = await getCache(cacheKey);
+    if (cachedData) {
+        return res.status(200).json(new ApiResponse(200, cachedData, "Payroll data retrieved from Cache", true));
+    }
 
     const query = {};
     if (month) query.month = month; 
@@ -494,12 +533,17 @@ const getFilteredPayroll = asyncHandler(async (req, res) => {
 
     const total = await Payroll.countDocuments(query);
 
-    return res.status(200).json(new ApiResponse(200, {
+    const responsePayload = {
         payrolls,
         totalPages: Math.ceil(total / limitNum),
         currentPage: pageNum,
         total
-    }, "Payroll data retrieved successfully", true));
+    };
+
+    // [CACHE WRITE]
+    await setCache(cacheKey, responsePayload, 3600);
+
+    return res.status(200).json(new ApiResponse(200, responsePayload, "Payroll data retrieved successfully", true));
 });
 
 // 6. Update Payroll (Manual Override)
@@ -610,6 +654,12 @@ const updatePayroll = asyncHandler(async (req, res) => {
     const updatedPayroll = await Payroll.findByIdAndUpdate(id, updateData, { new: true })
         .populate('employee', 'employeeId firstName lastName')
         .populate({ path: 'employee', populate: { path: 'post', select: 'title department' } });
+
+    // [CACHE INVALIDATION]
+    // 1. Clear this specific payroll record
+    await removeCache(`${CACHE_KEY.PREFIX}${id}`);
+    // 2. Clear lists
+    await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
 
     return res.status(200).json(new ApiResponse(200, updatedPayroll, "Payroll record updated successfully", true));
 });

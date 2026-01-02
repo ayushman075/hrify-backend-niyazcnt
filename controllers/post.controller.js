@@ -2,6 +2,13 @@ import { asyncHandler } from "../utils/AsyncHandler.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { Post } from "../models/post.model.js";
 import { User } from "../models/user.model.js";
+import { getCache, setCache, removeCache, removeCachePattern } from "../utils/cache.js";
+
+// Cache Key Strategy
+const CACHE_KEY = {
+  PREFIX: "post_",          // Single post: post_12345
+  LIST_PREFIX: "post_list_" // Query lists: post_list_page1_...
+};
 
 // Helper to sanitize salary and set defaults
 const sanitizeSalary = (inputSalary) => {
@@ -40,7 +47,7 @@ const createPost = asyncHandler(async (req, res) => {
     requirements,
     shiftTimings,
     lateAttendanceMetrics,
-    payrollType, // Added payrollType,
+    payrollType,
     isPfPayable
   } = req.body;
 
@@ -50,8 +57,7 @@ const createPost = asyncHandler(async (req, res) => {
     return res.status(401).json(new ApiResponse(401, {}, "Unauthorized Request", false));
   }
 
-  // VALIDATION: Location removed, PayrollType added.
-  // Salary Check: Ensure mandatory fields exist.
+  // VALIDATION
   if (
     !title ||
     !department ||
@@ -65,7 +71,7 @@ const createPost = asyncHandler(async (req, res) => {
       .json(new ApiResponse(409, {}, "Required fields (Title, Dept, Desc, PayrollType, Basic/Gross/Total Salary) are missing!"));
   }
 
-  const user = await User.findOne({ userId }); // Changed to findOne
+  const user = await User.findOne({ userId });
 
   if (!user) {
     return res.status(401).json(new ApiResponse(401, {}, "Unauthorized access", true));
@@ -78,9 +84,9 @@ const createPost = asyncHandler(async (req, res) => {
     title,
     description,
     department,
-    isPfPayable, // Added here
+    isPfPayable,
     salary: finalSalary,
-    payrollType, // Added here
+    payrollType,
     isHiring,
     workingHour,
     location, 
@@ -89,6 +95,9 @@ const createPost = asyncHandler(async (req, res) => {
     lateAttendanceMetrics,
     createdBy: user._id,
   });
+
+  // [CACHE INVALIDATION] New post added -> All lists are potentially stale
+  await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
 
   return res
     .status(201)
@@ -103,6 +112,16 @@ const getAllPosts = asyncHandler(async (req, res) => {
     order = "desc",
     filters = {},
   } = req.query;
+
+  // [CACHE READ] Create a unique key that includes filters
+  // JSON.stringify ensures different filter combinations are cached separately
+  const filterKey = JSON.stringify(filters);
+  const cacheKey = `${CACHE_KEY.LIST_PREFIX}p${page}_l${limit}_s${sort}_o${order}_f${filterKey}`;
+
+  const cachedData = await getCache(cacheKey);
+  if (cachedData) {
+    return res.status(200).json(new ApiResponse(200, cachedData, "Post fetched from Cache"));
+  }
 
   const query = {};
   if (filters.title) {
@@ -120,7 +139,7 @@ const getAllPosts = asyncHandler(async (req, res) => {
   if (filters.isHiring) {
     query.isHiring = filters.isHiring;
   }
-  if (filters.payrollType) { // Added filter for payrollType
+  if (filters.payrollType) { 
     query.payrollType = filters.payrollType;
   }
 
@@ -133,23 +152,40 @@ const getAllPosts = asyncHandler(async (req, res) => {
 
   const totalPosts = await Post.countDocuments(query);
 
-  return res.status(200).json(new ApiResponse(200, {
+  const responsePayload = {
     success: true,
     totalPosts,
     totalPages: Math.ceil(totalPosts / limit),
-    currentPage: page,
+    currentPage: parseInt(page),
     posts,
-  }, "Post fetched successfully"));
+  };
+
+  // [CACHE WRITE] Save results for 1 hour
+  await setCache(cacheKey, responsePayload, 3600);
+
+  return res.status(200).json(new ApiResponse(200, responsePayload, "Post fetched successfully"));
 });
 
 const getPost = asyncHandler(async (req, res) => {
-  const post = await Post.findById(req.params.id)
-    .populate("createdBy", "fullname")
-    .populate("department", "name"); // Usually good to populate department name too
+  const postId = req.params.id;
+  const cacheKey = `${CACHE_KEY.PREFIX}${postId}`;
+
+  // [CACHE READ] Check specific post cache
+  const cachedPost = await getCache(cacheKey);
+  if (cachedPost) {
+    return res.status(200).json(new ApiResponse(200, cachedPost, "Post retrieved from Cache!"));
+  }
+
+  const post = await Post.findById(postId)
+    .populate("createdBy", "fullName") 
+    .populate("department", "name"); 
 
   if (!post) {
     return res.status(404).json(new ApiResponse(404, {}, "Post not found!"));
   }
+
+  // [CACHE WRITE] Save specific post for 1 hour
+  await setCache(cacheKey, post, 3600);
 
   return res
     .status(200)
@@ -170,7 +206,7 @@ const updatePost = asyncHandler(async (req, res) => {
     shiftTimings,
     lateAttendanceMetrics,
     isPfPayable,
-    payrollType // Added payrollType
+    payrollType 
   } = req.body;
 
   const userId = req.auth.userId;
@@ -187,9 +223,8 @@ const updatePost = asyncHandler(async (req, res) => {
   post.title = title || post.title;
   post.description = description || post.description;
   post.department = department || post.department;
-  post.isPfPayable = isPfPayable !== undefined ? isPfPayable : post.isPfPayable; // boolean check fix
+  post.isPfPayable = isPfPayable !== undefined ? isPfPayable : post.isPfPayable;
   
-  // Update salary only if provided, applying defaults to the new object
   if (salary) {
     post.salary = sanitizeSalary(salary);
   }
@@ -198,12 +233,18 @@ const updatePost = asyncHandler(async (req, res) => {
   post.location = location || post.location;
   post.requirements = requirements || post.requirements;
   post.status = status || post.status;
-  post.isHiring = isHiring !== undefined ? isHiring : post.isHiring; // boolean check fix
+  post.isHiring = isHiring !== undefined ? isHiring : post.isHiring;
   post.shiftTimings = shiftTimings || post.shiftTimings;
   post.lateAttendanceMetrics = lateAttendanceMetrics || post.lateAttendanceMetrics;
-  post.payrollType = payrollType || post.payrollType; // Update payrollType
+  post.payrollType = payrollType || post.payrollType;
 
   await post.save();
+
+  // [CACHE INVALIDATION]
+  // 1. Remove this specific post's cache
+  await removeCache(`${CACHE_KEY.PREFIX}${req.params.id}`);
+  // 2. Remove all list caches (filters/sorts might now be different)
+  await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
 
   return res
     .status(200)
@@ -212,14 +253,9 @@ const updatePost = asyncHandler(async (req, res) => {
 
 const approvePost = asyncHandler(async (req, res) => {
   const userId = req.auth.userId;
-  if (!userId) {
-    return res.status(401).json(new ApiResponse(401, {}, "Unauthorized Request", false));
-  }
   
-  // Fixed: Use findOne and await
   const user = await User.findOne({ userId });
   
-  // Fixed: Role check logic
   if (!user || user.role !== "Admin") {
     return res.status(401).json(new ApiResponse(401, {}, "Only Admin can approve the post."));
   }
@@ -233,6 +269,10 @@ const approvePost = asyncHandler(async (req, res) => {
   post.status = 'Open';
   await post.save();
 
+  // [CACHE INVALIDATION]
+  await removeCache(`${CACHE_KEY.PREFIX}${req.params.id}`);
+  await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+
   return res
     .status(200)
     .json(new ApiResponse(200, post, "Post approved successfully!"));
@@ -241,10 +281,8 @@ const approvePost = asyncHandler(async (req, res) => {
 const disapprovePost = asyncHandler(async (req, res) => {
   const userId = req.auth.userId;
   
-  // Fixed: Use findOne and await
   const user = await User.findOne({ userId });
 
-  // Fixed: Role check logic
   if (!user || user.role !== "Admin") {
     return res.status(401).json(new ApiResponse(401, {}, "Only Admin can disapprove the post."));
   }
@@ -257,6 +295,10 @@ const disapprovePost = asyncHandler(async (req, res) => {
 
   post.status = 'Closed';
   await post.save();
+
+  // [CACHE INVALIDATION]
+  await removeCache(`${CACHE_KEY.PREFIX}${req.params.id}`);
+  await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
 
   return res
     .status(200)
@@ -278,8 +320,11 @@ const deletePost = asyncHandler(async (req, res) => {
     return res.status(404).json(new ApiResponse(404, {}, "Post not found!"));
   }
 
-  // Note: remove() is deprecated in newer Mongoose versions, prefer deleteOne()
   await post.deleteOne(); 
+
+  // [CACHE INVALIDATION]
+  await removeCache(`${CACHE_KEY.PREFIX}${req.params.id}`);
+  await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
 
   return res
     .status(200)
