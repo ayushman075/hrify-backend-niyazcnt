@@ -7,6 +7,18 @@ const EmployeeSchema = new Schema({
     type: Number,
     unique: true,
   },
+  azurePersonId: { 
+    type: String, 
+    select: false 
+  },
+  isFaceRegistered: { 
+    type: Boolean, 
+    default: false 
+  },
+  faceToken: {
+    type: String,
+    select: false // Optional: keep it hidden by default
+},
   firstName: { type: String, required: true },
   middleName: { type: String },
   lastName: { type: String},
@@ -15,6 +27,10 @@ const EmployeeSchema = new Schema({
     type:mongoose.Schema.Types.ObjectId,
     ref:"Post",
     required:true
+  },
+  site:{
+    type:mongoose.Schema.Types.ObjectId,
+    ref:"Site",
   },
   dateOfJoining:{
     type:Date,

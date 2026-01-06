@@ -5,15 +5,16 @@ import { ApiResponse } from '../utils/ApiResponse.js';
 import { ShiftRoster } from '../models/shiftRoster.model.js';
 import { Employee } from '../models/employee.model.js';
 import { getCache, setCache, removeCache, removeCachePattern } from "../utils/cache.js";
+import { invalidateDashboardCache } from './dashboard.controller.js';
 
 // Cache Keys Configuration
 const CACHE_KEY = {
-  PREFIX: "attendance_",           // Single ID: attendance_12345
-  LIST_PREFIX: "attendance_list_"  // Query lists: attendance_list_month_...
+  PREFIX: "attendance_",           // Single ID
+  LIST_PREFIX: "attendance_list_"  // Query lists
 };
 
 // --- Helper Function to derive Week ID (WWYY) ---
-const getWeekId = (dateInput) => {
+export const getWeekId = (dateInput) => {
   const date = new Date(dateInput);
   
   // Get Year (Last 2 digits)
@@ -32,24 +33,19 @@ const getWeekId = (dateInput) => {
   return `${weekString}${yearShort}`; // e.g., "0225"
 };
 
-const calculateAttendancePercentage = async (post, date, punchInTime, punchOutTime, scheduledShift) => {
-  if (!punchOutTime) {
-    return 0;
-  }
+const calculateAttendancePercentage = (post, date, punchInTime, punchOutTime, scheduledShift) => {
+  if (!punchOutTime) return 0; 
 
   let scheduledMinutes = 0;
 
-  // 1. Try to get minutes from Scheduled Shift
+  // 1. Try Shift Roster
   if (scheduledShift && scheduledShift.shiftId) {
     const shiftStartTime = scheduledShift.shiftId.startTime;
     const shiftEndTime = scheduledShift.shiftId.endTime;
-
-    const dateShiftStartTimeString = `${new Date().toDateString()} ${shiftStartTime}`;
-    const dateShiftEndTimeString = `${new Date().toDateString()} ${shiftEndTime}`;
-    
-    scheduledMinutes = Math.floor((new Date(dateShiftEndTimeString) - new Date(dateShiftStartTimeString)) / 60000);
+    const dateStr = new Date(date).toDateString(); 
+    scheduledMinutes = Math.floor((new Date(`${dateStr} ${shiftEndTime}`) - new Date(`${dateStr} ${shiftStartTime}`)) / 60000);
   } 
-  // 2. Fallback: Get minutes from Post Working Hours
+  // 2. Fallback to Post Working Hours
   else if (post && post.workingHour) {
     scheduledMinutes = post.workingHour * 60; 
   }
@@ -58,27 +54,25 @@ const calculateAttendancePercentage = async (post, date, punchInTime, punchOutTi
 
   const workedMinutes = Math.floor((new Date(punchOutTime) - new Date(punchInTime)) / 60000);
 
-  if (workedMinutes > scheduledMinutes) {
-    const simplePercentage = (workedMinutes / scheduledMinutes) * 100;
-    return Math.round(simplePercentage);
+  if (workedMinutes >= scheduledMinutes) {
+    return Math.round((workedMinutes / scheduledMinutes) * 100);
+  }
+
+  const absDifference = scheduledMinutes - workedMinutes;
+  const thresholds = post?.lateAttendanceMetrics || [];
+
+  const sortedMetrics = thresholds.sort((a, b) => b.allowedMinutes - a.allowedMinutes);
+  const largestMetric = sortedMetrics.length > 0 ? sortedMetrics[0] : null;
+
+  if (!largestMetric || absDifference > largestMetric.allowedMinutes) {
+     return Math.round((workedMinutes / scheduledMinutes) * 100);
   }
 
   let attendancePercentage = 100;
-  
-  const timeDifference = workedMinutes - scheduledMinutes; 
-  
-  const thresholds = post.lateAttendanceMetrics;
+  const applicableLateMetric = sortedMetrics.find(metric => absDifference > metric.allowedMinutes);
 
-  if (thresholds && timeDifference !== 0) {
-      const absDifference = Math.abs(timeDifference);
-      
-      const sortedMetrics = thresholds.sort((a, b) => b.allowedMinutes - a.allowedMinutes);
-
-      const applicableLateMetric = sortedMetrics.find(metric => absDifference > metric.allowedMinutes);
-
-      if (applicableLateMetric) {
-        attendancePercentage -= applicableLateMetric.attendanceDeductionPercent;
-      }
+  if (applicableLateMetric) {
+    attendancePercentage -= applicableLateMetric.attendanceDeductionPercent;
   }
 
   return Math.max(0, Math.round(attendancePercentage));
@@ -95,7 +89,6 @@ const createAttendance = asyncHandler(async (req, res) => {
       leaveId
     } = req.body;
 
-    // Validation
     if (!employeeId || !date || !(punchInTime || isLeave)) {
       return res.status(400).json(
         new ApiResponse(400, null, "Missing required fields", false)
@@ -108,13 +101,11 @@ const createAttendance = asyncHandler(async (req, res) => {
       punchOutTime = updatedPunchOutTime;
     }
 
-    // 1. Fetch Employee & Post FIRST
     const employee = await Employee.findById(employeeId).populate("post");
     if (!employee) {
        return res.status(404).json(new ApiResponse(404, null, "Employee not found", false));
     }
 
-    // 2. Get scheduled shift
     const scheduledShift = await ShiftRoster.findOne({
       employeeId,
       date: new Date(date)
@@ -122,7 +113,6 @@ const createAttendance = asyncHandler(async (req, res) => {
 
     let attendancePercentage = 100;
 
-    // 3. Calculate Percentage
     if (!isLeave) {
       attendancePercentage = await calculateAttendancePercentage(
         employee.post,
@@ -133,16 +123,13 @@ const createAttendance = asyncHandler(async (req, res) => {
       );
     }
 
-    // Get month name from date
     const monthDate = new Date(date);
     const monthYear = monthDate.getFullYear();
     const monthMonth = String(monthDate.getMonth() + 1).padStart(2, '0');
     const month = `${monthYear}-${monthMonth}`;
 
-    // --- Derive Week ---
     const week = getWeekId(date);
 
-    // Prepare attendance data
     const attendanceData = {
       employeeId,
       date: new Date(date),
@@ -155,7 +142,6 @@ const createAttendance = asyncHandler(async (req, res) => {
       attendancePercentage
     };
 
-    // Try to find existing attendance record
     const existingAttendance = await Attendance.findOne({
       employeeId,
       date: new Date(date)
@@ -163,26 +149,23 @@ const createAttendance = asyncHandler(async (req, res) => {
 
     let attendance;
     if (existingAttendance) {
-      // Update existing record
       attendance = await Attendance.findByIdAndUpdate(
         existingAttendance._id,
         attendanceData,
         { new: true }
       );
       
-      // [CACHE INVALIDATION]
       await removeCache(`${CACHE_KEY.PREFIX}${existingAttendance._id}`);
       await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+      await invalidateDashboardCache();
 
       return res.status(200).json(
         new ApiResponse(200, attendance, "Attendance updated successfully", true)
       );
     } else {
-      // Create new record
       attendance = new Attendance(attendanceData);
       await attendance.save();
 
-      // [CACHE INVALIDATION]
       await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
 
       return res.status(201).json(
@@ -205,7 +188,6 @@ const getAttendanceById = asyncHandler(async (req, res) => {
     return res.status(400).json(new ApiResponse(400, {}, "Employee ID and date are required", false));
   }
 
-  // [CACHE READ] Create a key specific to this query
   const cacheKey = `${CACHE_KEY.LIST_PREFIX}one_emp${employeeId}_date${new Date(date).toISOString().split('T')[0]}`;
   const cachedData = await getCache(cacheKey);
 
@@ -219,7 +201,6 @@ const getAttendanceById = asyncHandler(async (req, res) => {
     return res.status(404).json(new ApiResponse(404, {}, "Attendance not found", false));
   }
 
-  // [CACHE WRITE]
   await setCache(cacheKey, attendance, 3600);
 
   return res.status(200).json(new ApiResponse(200, attendance, "Attendance fetched successfully", true));
@@ -232,7 +213,6 @@ const getAttendanceByMonth = asyncHandler(async (req, res) => {
     return res.status(400).json(new ApiResponse(400, {}, "Employee ID and month are required", false));
   }
 
-  // [CACHE READ]
   const cacheKey = `${CACHE_KEY.LIST_PREFIX}emp${employeeId}_mon${month}`;
   const cachedData = await getCache(cacheKey);
   if (cachedData) {
@@ -245,7 +225,6 @@ const getAttendanceByMonth = asyncHandler(async (req, res) => {
     return res.status(404).json(new ApiResponse(404, {}, "No attendance records found for this employee in the given month", false));
   }
 
-  // [CACHE WRITE]
   await setCache(cacheKey, attendance, 3600);
 
   return res.status(200).json(new ApiResponse(200, attendance, "Attendance records fetched successfully", true));
@@ -258,7 +237,6 @@ const getAllAttendanceForMonth = asyncHandler(async (req, res) => {
     return res.status(400).json(new ApiResponse(400, {}, "Month is required", false));
   }
 
-  // [CACHE READ]
   const cacheKey = `${CACHE_KEY.LIST_PREFIX}all_mon${month}`;
   const cachedData = await getCache(cacheKey);
   if (cachedData) {
@@ -267,7 +245,6 @@ const getAllAttendanceForMonth = asyncHandler(async (req, res) => {
 
   const attendance = await Attendance.find({ month }).populate('employeeId');
 
-  // [CACHE WRITE]
   await setCache(cacheKey, attendance, 3600);
 
   return res.status(200).json(new ApiResponse(200, attendance, "Attendance records for the month fetched successfully", true));
@@ -288,7 +265,6 @@ const updateAttendance = asyncHandler(async (req, res) => {
   if (isLeave !== undefined) attendance.isLeave = isLeave;
   if (leaveId) attendance.leaveId = leaveId;
   
-  // Update week if date changes
   if (date) {
     attendance.date = new Date(date);
     attendance.week = getWeekId(date); 
@@ -301,7 +277,6 @@ const updateAttendance = asyncHandler(async (req, res) => {
 
   let attendancePercentage = 100;
   
-  // Fallback Logic
   const employee = await Employee.findById(attendance.employeeId).populate("post");
 
   if (!isLeave && employee) {
@@ -317,7 +292,6 @@ const updateAttendance = asyncHandler(async (req, res) => {
 
   await attendance.save();
 
-  // [CACHE INVALIDATION]
   await removeCache(`${CACHE_KEY.PREFIX}${id}`);
   await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
 
@@ -333,9 +307,9 @@ const deleteAttendance = asyncHandler(async (req, res) => {
     return res.status(404).json(new ApiResponse(404, {}, "Attendance not found", false));
   }
 
-  // [CACHE INVALIDATION]
   await removeCache(`${CACHE_KEY.PREFIX}${id}`);
   await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+  await invalidateDashboardCache();
 
   return res.status(200).json(new ApiResponse(200, {}, "Attendance deleted successfully", true));
 });
@@ -347,7 +321,6 @@ const getAttendanceByWeek = asyncHandler(async (req, res) => {
     return res.status(400).json(new ApiResponse(400, {}, "Valid Week identifier (WWYY) is required (e.g., 0225)", false));
   }
 
-  // [CACHE READ]
   const cacheKey = `${CACHE_KEY.LIST_PREFIX}week${week}_emp${employeeId || 'all'}`;
   const cachedData = await getCache(cacheKey);
   if (cachedData) {
@@ -362,11 +335,9 @@ const getAttendanceByWeek = asyncHandler(async (req, res) => {
   const attendance = await Attendance.find(query).populate('employeeId');
 
   if (!attendance || attendance.length === 0) {
-    // Note: We don't cache 404s usually, or cache empty array. Here caching empty array is fine.
     return res.status(404).json(new ApiResponse(404, [], "No attendance records found for this week", false));
   }
 
-  // [CACHE WRITE]
   await setCache(cacheKey, attendance, 3600);
 
   return res.status(200).json(new ApiResponse(200, attendance, "Attendance records for the week fetched successfully", true));
@@ -382,7 +353,6 @@ const getAllAttendanceForWeek = asyncHandler(async (req, res) => {
      return res.status(400).json(new ApiResponse(400, {}, "Invalid Week format. Use WWYY (e.g., 0225)", false));
   }
 
-  // [CACHE READ]
   const cacheKey = `${CACHE_KEY.LIST_PREFIX}all_week${week}`;
   const cachedData = await getCache(cacheKey);
   if (cachedData) {
@@ -391,7 +361,6 @@ const getAllAttendanceForWeek = asyncHandler(async (req, res) => {
 
   const attendance = await Attendance.find({ week }).populate('employeeId');
 
-  // [CACHE WRITE]
   await setCache(cacheKey, attendance, 3600);
 
   return res.status(200).json(new ApiResponse(200, attendance, "Attendance records for the week fetched successfully", true));
@@ -476,8 +445,6 @@ const bulkCreateAttendance = asyncHandler(async (req, res) => {
       if (existingAttendance) {
         attendance = await Attendance.findByIdAndUpdate(existingAttendance._id, attendanceObj, { new: true });
         updatedAttendance.push(attendance);
-        // We invalidate individual cache inside the loop or bulk invalidate at the end.
-        // Doing strictly required key invalidation here:
         await removeCache(`${CACHE_KEY.PREFIX}${existingAttendance._id}`);
       } else {
         attendance = new Attendance(attendanceObj);
@@ -492,9 +459,8 @@ const bulkCreateAttendance = asyncHandler(async (req, res) => {
     }
   }
 
-  // [CACHE INVALIDATION]
-  // Bulk operations affect many lists, safest to clear all attendance lists
   await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+  await invalidateDashboardCache();
 
   return res.status(201).json(
     new ApiResponse(
@@ -510,6 +476,7 @@ const bulkCreateAttendance = asyncHandler(async (req, res) => {
   );
 });
 
+// --- UPDATED FUNCTION ---
 const getFilteredAttendance = asyncHandler(async (req, res) => {
   const {
     sort = "date",
@@ -519,8 +486,7 @@ const getFilteredAttendance = asyncHandler(async (req, res) => {
     limit = 10
   } = req.query;
 
-  // [CACHE READ] Complex unique key for filtered queries
-  // We stringify filters to ensure exact match on criteria
+  // [CACHE READ] Key includes filters, so site filter is automatically handled in caching
   const filterKey = JSON.stringify(filters);
   const cacheKey = `${CACHE_KEY.LIST_PREFIX}filter_p${page}_l${limit}_s${sort}_o${order}_f${filterKey}`;
   
@@ -535,9 +501,42 @@ const getFilteredAttendance = asyncHandler(async (req, res) => {
 
   const query = {};
 
-  if (filters.employeeId) {
+  // --- SITE FILTER LOGIC ---
+  // Attendance doesn't store site, so we must fetch employees belonging to the site first.
+  if (filters.site) {
+    try {
+      // 1. Find all employees at this site
+      const employeesAtSite = await Employee.find({ site: filters.site }).select('_id');
+      const siteEmployeeIds = employeesAtSite.map(emp => emp._id);
+
+      // 2. Handle potential conflict if `filters.employeeId` is also present
+      if (filters.employeeId) {
+        const isEmployeeAtSite = siteEmployeeIds.some(
+            id => id.toString() === filters.employeeId.toString()
+        );
+        
+        if (isEmployeeAtSite) {
+            query.employeeId = filters.employeeId;
+        } else {
+            // The specific employee requested is NOT at the specific site requested.
+            // Force return 0 results.
+            query.employeeId = null; 
+        }
+      } else {
+        // 3. Filter Attendance by list of IDs from that site
+        // If site has no employees, siteEmployeeIds is [], result will be empty.
+        query.employeeId = { $in: siteEmployeeIds };
+      }
+    } catch (error) {
+        console.error("Error filtering by site:", error);
+        // Fail gracefully or throw? Returning empty list usually safer for filter errors.
+        return res.status(500).json(new ApiResponse(500, null, "Error applying site filter", false));
+    }
+  } else if (filters.employeeId) {
+    // Standard employee filter (if no site filter)
     query.employeeId = filters.employeeId;
   }
+  // -------------------------
 
   if (filters.month) {
     query.month = filters.month;
@@ -561,6 +560,7 @@ const getFilteredAttendance = asyncHandler(async (req, res) => {
   try {
     const attendance = await Attendance.find(query)
       .populate("employeeId")
+      .populate({ path: 'employeeId', populate: { path: 'site', select: 'siteName' } }) // Populate site info in response
       .sort({ [sort]: order === "desc" ? -1 : 1 })
       .skip((pageNum - 1) * limitNum)
       .limit(limitNum);

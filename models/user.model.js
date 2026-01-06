@@ -26,6 +26,10 @@ const userSchema=new Schema(
           default:'Employee',
           enum: ["Admin", "HR Manager", "HR Assistant","Head of Department","Employee"],
         },
+        azurePersonId: { 
+        type: String, 
+        select: false // Keep it private
+    },
         employeeId: {
           type: mongoose.Types.ObjectId,
           ref:'Employee'

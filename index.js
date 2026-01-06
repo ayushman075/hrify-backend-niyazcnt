@@ -11,7 +11,7 @@ dotenv.config({
 });
 
 app.use(cors({
-  origin:['http://localhost:5174','http://localhost:8081','https://iridescent-parfait-9b7d28.netlify.app','*','http://localhost:5173','https://hrify-frontend-plum.vercel.app','https://hrify-frontend-crvwhg7b2-ayushman075s-projects.vercel.app','https://hrify-niyazcnt.vercel.app'],
+  origin:['http://localhost:5174','http://192.168.1.5:5555','https://iridescent-parfait-9b7d28.netlify.app','*','http://localhost:5173','https://hrify-frontend-plum.vercel.app','https://hrify-frontend-crvwhg7b2-ayushman075s-projects.vercel.app','https://hrify-niyazcnt.vercel.app'],
   credentials:true,
  methods:['GET','POST','DELETE','PUT','PATCH'],
  
@@ -52,6 +52,10 @@ import { pdfRouter } from "./routes/pdfGeneration.route.js";
 import leaveLimitRouter from "./routes/leaveLimit.route.js";
 import { startAttendanceReconciliationCron } from "./services/biometricCron.service.js";
 import biometricRouter from "./routes/biometricAttendance.route.js";
+import faceRouter from "./routes/face.route.js";
+import checkInRouter from "./routes/checkIn.route.js";
+import { worker } from "./workers/attendance.worker.js";
+import { siteRouter } from "./routes/site.route.js";
 
 
 
@@ -60,6 +64,10 @@ import biometricRouter from "./routes/biometricAttendance.route.js";
 app.use("/api/v1/user",userRouter)
 app.use("/api/v1/post",postRouter)
 app.use("/api/v1/employee",employeeRouter)
+app.use("/api/v1/site",siteRouter)
+app.use("/api/v1/face",faceRouter)
+app.use("/api/v1/checkIn",checkInRouter)
+
 app.use("/api/v1/candidate",candidateRouter)
 app.use("/api/v1/shift",shiftRouter)
 app.use("/api/v1/shiftRoster",shiftRosterRouter)
@@ -165,6 +173,7 @@ app.use("/api/v1/biometric",biometricRouter);
 
 emailWorker;
 pdfGeneratorWorker;
+worker;
 
 const port = process.env.PORT||3005;
 

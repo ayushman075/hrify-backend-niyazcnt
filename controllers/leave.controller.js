@@ -7,6 +7,7 @@ import { ApiResponse } from "../utils/ApiResponse.js";
 import { asyncHandler } from "../utils/AsyncHandler.js";
 import { Employee } from "../models/employee.model.js";
 import { getCache, setCache, removeCache, removeCachePattern } from "../utils/cache.js";
+import { invalidateDashboardCache } from "./dashboard.controller.js";
 
 // Cache Keys Configuration
 const CACHE_KEY = {
@@ -57,6 +58,7 @@ export const applyForLeave = asyncHandler(async (req, res) => {
 
   // [CACHE INVALIDATION] New leave applied -> Clear lists
   await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+  await invalidateDashboardCache();
 
   return res
     .status(201)
@@ -261,6 +263,8 @@ export const approveOrDisapproveLeave = asyncHandler(async (req, res) => {
     });
     // [CACHE INVALIDATION] Attendance removed! Clear attendance lists.
     await removeCachePattern(`${CACHE_KEY.ATTENDANCE_LIST}*`);
+  await invalidateDashboardCache();
+
   }
 
   leaveApplication.status = status;
@@ -316,6 +320,8 @@ export const updateLeaveApplication = asyncHandler(async (req, res) => {
   // [CACHE INVALIDATION]
   await removeCache(`${CACHE_KEY.PREFIX}${id}`);
   await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+  await invalidateDashboardCache();
+
 
   return res
     .status(200)

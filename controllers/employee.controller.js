@@ -17,7 +17,7 @@ const createEmployee = asyncHandler(async (req, res) => {
         employeeId, firstName, middleName, lastName, post, dateOfJoining,gender, dateOfBirth, maritalStatus, 
         contactNo, email, photoUrl, signatureUrl, aadharNo, panNo, esiNo, uanNo, epfNo, 
         presentAddress, permanentAddress, familyDetails, educationDetails, employmentHistory, 
-        emergencyContact, bankAccountDetails, nominationDetails, generalInformation, status
+        emergencyContact, bankAccountDetails, nominationDetails, generalInformation, status, site // Added site here just in case it's in body
     } = req.body;
 
     // Validation for required fields
@@ -36,7 +36,7 @@ const createEmployee = asyncHandler(async (req, res) => {
         employeeId, firstName, middleName, lastName, post, dateOfJoining,gender, dateOfBirth, maritalStatus, 
         contactNo, email, photo:photoUrl, signature:signatureUrl, aadharNo, panNo, esiNo, uanNo, epfNo, status,
         presentAddress, permanentAddress, familyDetails, educationDetails, employmentHistory, 
-        emergencyContact, bankAccountDetails, nominationDetails, generalInformation
+        emergencyContact, bankAccountDetails, nominationDetails, generalInformation, site // Pass site to creation
     });
 
     if (!employee) {
@@ -44,9 +44,7 @@ const createEmployee = asyncHandler(async (req, res) => {
     }
 
     // [CACHE INVALIDATION]
-    // 1. Clear general lists
     await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
-    // 2. Clear birthday list (in case new employee has birthday today)
     await removeCache(CACHE_KEY.BIRTHDAY_LIST);
 
     res.status(201).json(new ApiResponse(201, employee, 'Employee created successfully.'));
@@ -91,6 +89,7 @@ export const uploadEmployeePhoto = asyncHandler(async (req,res)=>{
 );
 })
 
+// --- UPDATED FUNCTION ---
 const getAllEmployees = asyncHandler(async (req, res) => {
     const {
       page = 1,
@@ -101,6 +100,7 @@ const getAllEmployees = asyncHandler(async (req, res) => {
     } = req.query;
   
     // [CACHE READ] Unique key based on query params
+    // Because we stringify filters, the new 'site' filter will automatically generate a unique cache key.
     const filterKey = JSON.stringify(filters);
     const cacheKey = `${CACHE_KEY.LIST_PREFIX}p${page}_l${limit}_s${sort}_o${order}_f${filterKey}`;
     
@@ -133,6 +133,13 @@ const getAllEmployees = asyncHandler(async (req, res) => {
     if (filters.status) {
       query.status = filters.status; 
     }
+    
+    // --- SITE FILTER ADDED HERE ---
+    if (filters.site) {
+      query.site = filters.site;
+    }
+    // -----------------------------
+
     if (filters.employeeId) {
       query.employeeId = filters.employeeId;
     }
@@ -153,8 +160,10 @@ const getAllEmployees = asyncHandler(async (req, res) => {
     }
   
     // Fetch employees
+    // Populating 'site' as well so the frontend receives the site name/details
     const employees = await Employee.find(query)
-      .populate("post", "title") 
+      .populate("post", "title")
+      .populate("site", "siteName") //  Optional: populate site details if needed
       .sort({ [sort]: order === "desc" ? -1 : 1 })
       .skip((page - 1) * limit)
       .limit(parseInt(limit));
@@ -190,7 +199,10 @@ const getEmployeeById = asyncHandler(async (req, res) => {
         return res.status(200).json(new ApiResponse(200, cachedEmployee, 'Employee retrieved from Cache.'));
     }
 
-    const employee = await Employee.findById(employeeId);
+    // Populating site here as well for consistency
+    const employee = await Employee.findById(employeeId)
+        .populate("post", "title")
+        .populate("site", "name");
 
     if (!employee) {
         return res.status(404).json(new ApiResponse(404, {}, 'Employee not found.'));
@@ -207,7 +219,7 @@ const updateEmployee = asyncHandler(async (req, res) => {
         firstName, middleName, lastName, post,dateOfJoining, gender, dateOfBirth, maritalStatus, 
         contactNo, email, photoUrl, signatureUrl, aadharNo, panNo, esiNo, uanNo, epfNo, status,
         presentAddress, permanentAddress, familyDetails, educationDetails, employmentHistory, 
-        emergencyContact, bankAccountDetails, nominationDetails, generalInformation
+        emergencyContact, bankAccountDetails, nominationDetails, generalInformation, site
     } = req.body;
 
     if (!firstName || !post || !gender || !dateOfBirth || !contactNo) {
@@ -225,7 +237,7 @@ const updateEmployee = asyncHandler(async (req, res) => {
             firstName, middleName, lastName, dateOfJoining,post, gender, dateOfBirth, maritalStatus, 
             contactNo, email,  photo:photoUrl, signature:signatureUrl, aadharNo, panNo, esiNo, uanNo, epfNo, status,
             presentAddress, permanentAddress, familyDetails, educationDetails, employmentHistory, 
-            emergencyContact, bankAccountDetails, nominationDetails, generalInformation
+            emergencyContact, bankAccountDetails, nominationDetails, generalInformation, site
         },
         { new: true, runValidators: true }
     );
@@ -235,11 +247,8 @@ const updateEmployee = asyncHandler(async (req, res) => {
     }
 
     // [CACHE INVALIDATION]
-    // 1. Clear specific employee cache
     await removeCache(`${CACHE_KEY.PREFIX}${req.params.id}`);
-    // 2. Clear all list caches
     await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
-    // 3. Clear birthday list (dates might have changed)
     await removeCache(CACHE_KEY.BIRTHDAY_LIST);
 
     res.status(200).json(new ApiResponse(200, updatedEmployee, 'Employee updated successfully.'));
@@ -253,11 +262,8 @@ const deleteEmployee = asyncHandler(async (req, res) => {
     }
 
     // [CACHE INVALIDATION]
-    // 1. Clear specific employee cache
     await removeCache(`${CACHE_KEY.PREFIX}${req.params.id}`);
-    // 2. Clear all list caches
     await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
-    // 3. Clear birthday list
     await removeCache(CACHE_KEY.BIRTHDAY_LIST);
 
     res.status(200).json(new ApiResponse(200, {}, 'Employee deleted successfully.'));
@@ -281,10 +287,9 @@ const getEmployeesWithBirthdayToday = asyncHandler(async (req, res) => {
                 { $eq: [{ $dayOfMonth: "$dateOfBirth" }, todayDay] }
             ]
         }
-    }).populate("post","title");
+    }).populate("post","title").populate("site", "name");
 
-    // [CACHE WRITE] Save for 12 hours (43200 seconds) so it refreshes next day
-    // Note: Invalidated on any CREATE/UPDATE/DELETE action to ensure accuracy
+    // [CACHE WRITE] Save for 12 hours
     await setCache(CACHE_KEY.BIRTHDAY_LIST, employees, 43200);
 
     return res.status(200).json(

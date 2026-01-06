@@ -31,5 +31,9 @@ const pdfGenerationQueue = new Queue('pdfGenerationQueue',{
   connection:redis,
 })
 
-export {emailQueue,pdfGenerationQueue,redis}
+const attendanceQueue = new Queue('attendanceQueue', {
+  connection: redis,
+});
+
+export {emailQueue,pdfGenerationQueue,attendanceQueue,redis}
 

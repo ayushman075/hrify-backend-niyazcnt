@@ -7,6 +7,7 @@ import { Holiday } from '../models/holidays.model.js';
 import dayjs from 'dayjs';
 import isoWeek from 'dayjs/plugin/isoWeek.js';
 import { getCache, setCache, removeCache, removeCachePattern } from "../utils/cache.js";
+import { invalidateDashboardCache } from './dashboard.controller.js';
 
 // Extend dayjs with ISO Week plugin for accurate weekly calculations
 dayjs.extend(isoWeek);
@@ -18,7 +19,7 @@ const CACHE_KEY = {
 };
 
 // ------------------------------------------------------------------
-// --- HELPER FUNCTIONS (Preserved as is) ---
+// --- HELPER FUNCTIONS ---
 // ------------------------------------------------------------------
 
 const getWeekDateRange = (weekId) => {
@@ -60,13 +61,9 @@ const calculateTotalDeductions = (components, taxes) => {
 };
 
 // ------------------------------------------------------------------
-// --- CORE CALCULATION LOGIC (Preserved as is) ---
+// --- CORE CALCULATION LOGIC ---
 // ------------------------------------------------------------------
 
-/**
- * Calculates attendance metrics by iterating day-by-day over the period.
- * Ensures priority: Holiday > Sunday > Leave > Present > Absent
- */
 const calculateAttendanceMetrics = async (attendanceRecords, startDate, endDate, isSundayHoliday) => {
     let workingDays = 0;   // Scheduled working days (excluding holidays)
     let presentDays = 0;
@@ -158,10 +155,6 @@ const calculateAttendanceMetrics = async (attendanceRecords, startDate, endDate,
     };
 };
 
-/**
- * Calculates Salary Components.
- * Checks Post config for PF/ESI applicability.
- */
 const calculateSalaryComponents = (post, metrics) => {
     const { totalDaysPayable } = metrics;
     // Standard daily rate assumption (Month = 30 days)
@@ -266,7 +259,7 @@ const calculateEmployeePayrollData = async (employee, periodData) => {
 
 // 1. Generate MONTHLY Payroll
 const generateMonthlyPayroll = asyncHandler(async (req, res) => {
-    const { month } = req.body; // YYYY-MM
+    const { month } = req.body; // YYYY-MM (Site removed as per request)
 
     if (!month) {
         return res.status(400).json(new ApiResponse(400, null, "Month is required", false));
@@ -330,8 +323,9 @@ const generateMonthlyPayroll = asyncHandler(async (req, res) => {
         }
     }
 
-    // [CACHE INVALIDATION] Data generated -> All payroll query lists are stale
+    // [CACHE INVALIDATION]
     await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+    await invalidateDashboardCache();
 
     return res.status(200).json(new ApiResponse(200, results, "Monthly payroll processing completed", true));
 });
@@ -339,7 +333,7 @@ const generateMonthlyPayroll = asyncHandler(async (req, res) => {
 
 // 2. Generate WEEKLY Payroll
 const generateWeeklyPayroll = asyncHandler(async (req, res) => {
-    const { week } = req.body; // WWYY
+    const { week } = req.body; // WWYY (Site removed as per request)
 
     if (!week || !/^\d{4}$/.test(week)) {
         return res.status(400).json(new ApiResponse(400, null, "Valid Week (WWYY) is required", false));
@@ -404,6 +398,7 @@ const generateWeeklyPayroll = asyncHandler(async (req, res) => {
 
     // [CACHE INVALIDATION]
     await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+    await invalidateDashboardCache();
 
     return res.status(200).json(new ApiResponse(200, results, "Weekly payroll processing completed", true));
 });
@@ -472,9 +467,9 @@ const processEmployeePayroll = asyncHandler(async (req, res) => {
     );
 
     // [CACHE INVALIDATION]
-    // Invalidate lists and, specifically if we could predict the ID, that record. 
-    // Since we did findOneAndUpdate, we can try invalidating the ID if we knew the old one, but clearing lists is safer.
     await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+    await invalidateDashboardCache();
+    
 
     return res.status(200).json(new ApiResponse(200, payroll, "Payroll processed successfully", true));
 });
@@ -506,7 +501,7 @@ const getPayrollById = asyncHandler(async (req, res) => {
 
 // 5. Get Filtered Payroll
 const getFilteredPayroll = asyncHandler(async (req, res) => {
-    const { month, employeeId, status, sort = "createdAt", order = "desc", page = 1, limit = 10 } = req.query;
+    const { month, employeeId, status, site, sort = "createdAt", order = "desc", page = 1, limit = 10 } = req.query;
 
     // [CACHE READ]
     const filterKey = JSON.stringify(req.query);
@@ -520,13 +515,46 @@ const getFilteredPayroll = asyncHandler(async (req, res) => {
     const query = {};
     if (month) query.month = month; 
     if (status) query.status = status;
-    if (employeeId) query.employee = employeeId;
+
+    // --- SITE FILTER LOGIC (Kept as required) ---
+    if (site) {
+        try {
+            // Step 1: Find all employees at this site
+            const employeesAtSite = await Employee.find({ site }).select('_id');
+            const siteEmployeeIds = employeesAtSite.map(emp => emp._id);
+
+            if (employeeId) {
+                // If user requests a specific employee AND a site, check if they intersect
+                const isEmployeeAtSite = siteEmployeeIds.some(
+                    id => id.toString() === employeeId.toString()
+                );
+                
+                if (isEmployeeAtSite) {
+                    query.employee = employeeId;
+                } else {
+                    // Conflict: The specific employee is NOT at the requested site.
+                    query.employee = null; // Force empty result
+                }
+            } else {
+                // Step 2: Filter Payroll by list of IDs from that site
+                query.employee = { $in: siteEmployeeIds };
+            }
+        } catch (error) {
+            console.error("Error filtering by site in Payroll:", error);
+            return res.status(500).json(new ApiResponse(500, null, "Error applying site filter", false));
+        }
+    } else if (employeeId) {
+        // Normal employee filter
+        query.employee = employeeId;
+    }
+    // -------------------------
 
     const pageNum = parseInt(page);
     const limitNum = parseInt(limit);
 
     const payrolls = await Payroll.find(query)
         .populate({ path: 'employee', populate: { path: 'post', populate: { path: 'department' } } })
+        .populate({ path: 'employee', populate: { path: 'site', select: 'siteName' } }) // Populate site info in response
         .sort({ [sort]: order === "asc" ? 1 : -1 })
         .skip((pageNum - 1) * limitNum)
         .limit(limitNum);
@@ -660,6 +688,8 @@ const updatePayroll = asyncHandler(async (req, res) => {
     await removeCache(`${CACHE_KEY.PREFIX}${id}`);
     // 2. Clear lists
     await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+    await invalidateDashboardCache();
+    
 
     return res.status(200).json(new ApiResponse(200, updatedPayroll, "Payroll record updated successfully", true));
 });
