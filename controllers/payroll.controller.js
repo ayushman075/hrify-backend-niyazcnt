@@ -6,17 +6,19 @@ import { Payroll } from '../models/payroll.model.js';
 import { Holiday } from '../models/holidays.model.js';
 import dayjs from 'dayjs';
 import isoWeek from 'dayjs/plugin/isoWeek.js';
-import weekday from 'dayjs/plugin/weekday.js'; // Added for extra safety
+import utc from 'dayjs/plugin/utc.js';            // REQUIRED
+import timezone from 'dayjs/plugin/timezone.js';   // REQUIRED
 import { getCache, setCache, removeCache, removeCachePattern } from "../utils/cache.js";
 import { invalidateDashboardCache } from './dashboard.controller.js';
-import utc from 'dayjs/plugin/utc.js';
-import timezone from 'dayjs/plugin/timezone.js';
 
 // Extend dayjs plugins
 dayjs.extend(isoWeek);
-dayjs.extend(weekday);
 dayjs.extend(utc);
 dayjs.extend(timezone);
+
+
+const TIMEZONE = "Asia/Kolkata";
+
 
 // Cache Keys Configuration
 const CACHE_KEY = {
@@ -34,14 +36,16 @@ const getWeekDateRange = (weekId) => {
     const yearShort = parseInt(weekId.substring(2, 4));
     const year = 2000 + yearShort;
     
-    // KEY FIX: Use dayjs.utc() to ignore server timezone completely
-    // We construct the date in UTC directly.
-    const start = dayjs.utc()
+    // 1. Create a UTC-based anchor in the target timezone
+    // 2. We use .tz(TIMEZONE, true) to ensure we are working with wall-clock time in India
+    const start = dayjs()
         .year(year)
         .isoWeek(week)
-        .startOf('isoWeek'); // This automatically snaps to Monday 00:00:00 UTC
+        .startOf('isoWeek') // Finds Monday
+        .tz(TIMEZONE, true) // Force interpretation as IST
+        .startOf('day');    // Ensure 00:00:00 IST
     
-    const end = start.endOf('isoWeek'); // This snaps to Sunday 23:59:59 UTC
+    const end = start.add(6, 'day').endOf('day'); // Sunday 23:59:59 IST
     
     return { 
         start: start.toDate(), 
@@ -77,6 +81,7 @@ const calculateTotalDeductions = (components, taxes) => {
 // --- CORE CALCULATION LOGIC ---
 // ------------------------------------------------------------------
 
+
 const calculateAttendanceMetrics = async (attendanceRecords, startDate, endDate, isSundayHoliday) => {
     let workingDays = 0;   
     let presentDays = 0;
@@ -85,40 +90,42 @@ const calculateAttendanceMetrics = async (attendanceRecords, startDate, endDate,
     let holidays = 0;
     let absent = 0;
 
-    const start = dayjs(startDate);
-    const end = dayjs(endDate);
+    // CONVERT INPUTS TO FIXED TIMEZONE OBJECTS
+    const start = dayjs(startDate).tz(TIMEZONE);
+    const end = dayjs(endDate).tz(TIMEZONE);
     const totalDays = end.diff(start, 'day') + 1;
 
-    // 1. Fetch Holidays within range (For logic calculation)
+    // 1. Fetch Holidays within range
     const holidayRecords = await Holiday.find({
         date: { $gte: start.toDate(), $lte: end.toDate() },
         isActive: true
     });
     
-    // Format holidays to YYYY-MM-DD for comparison
-    const holidaySet = new Set(holidayRecords.map(h => dayjs(h.date).format('YYYY-MM-DD')));
+    // Create Set using IST Formatted Dates
+    const holidaySet = new Set(holidayRecords.map(h => dayjs(h.date).tz(TIMEZONE).format('YYYY-MM-DD')));
 
-    // 2. Map Attendance Records for O(1) lookup
-    // Using Map allows us to robustly match dates even if time components differ slightly
+    // 2. Map Attendance Records
+    // CRITICAL FIX: Format the key using the same Timezone as the loop
     const attendanceMap = new Map();
     attendanceRecords.forEach(rec => {
-        const d = dayjs(rec.date).format('YYYY-MM-DD');
+        // Even if server is UTC, this converts the record time to IST "Wall Clock" date
+        const d = dayjs(rec.date).tz(TIMEZONE).format('YYYY-MM-DD');
         attendanceMap.set(d, rec);
     });
 
-    // 3. Iterate Day-by-Day (Strict 7 Day Loop for Weekly, ~30 for Monthly)
+    // 3. Iterate Day-by-Day
     for (let i = 0; i < totalDays; i++) {
         const current = start.add(i, 'day');
-        const dateString = current.format('YYYY-MM-DD');
-        const dayOfWeek = current.day(); // 0 is Sunday, 1 is Monday...
+        const dateString = current.format('YYYY-MM-DD'); // Matches Map key format
+        const dayOfWeek = current.day(); // 0 is Sunday
         
-        // Priority 1: Check Official Holiday (Global Holidays)
+        // Priority 1: Check Official Holiday
         if (holidaySet.has(dateString)) {
             holidays++;
             continue; 
         } 
         
-        // Priority 2: Check Sunday Logic (based on payrollType)
+        // Priority 2: Check Sunday Logic
         if (dayOfWeek === 0 && isSundayHoliday) {
             holidays++; 
             continue;
@@ -127,31 +134,26 @@ const calculateAttendanceMetrics = async (attendanceRecords, startDate, endDate,
         // If not a holiday, it is a scheduled working day
         workingDays++;
 
-        // Priority 3: Check Attendance (Fetch from the Map created via Week ID query)
+        // Priority 3: Check Attendance
         const record = attendanceMap.get(dateString);
 
         if (record) {
             if (record.isLeave) {
-                // Check if Leave Type is Paid
                 if (record.leaveId?.leaveType?.isPaidLeave) {
                     paidLeaveDays++;
                 } else {
                     unpaidLeave++;
                 }
             } else if (record.punchInTime) {
-                // Add fractional day based on attendance percentage
                 presentDays += (record.attendancePercentage || 0) / 100;
             }
         } else {
-            // No record found in the set fetched by Week ID -> Absent
             absent++;
         }
     }
 
-    // 4. Calculate Payables
     const totalDaysPayable = presentDays + paidLeaveDays + holidays;
     const totalDaysNonPayable = unpaidLeave + absent;
-    
     const attendancePercentage = workingDays > 0 ? (presentDays / workingDays) * 100 : 0;
 
     return {
@@ -172,7 +174,6 @@ const calculateAttendanceMetrics = async (attendanceRecords, startDate, endDate,
 
 const calculateSalaryComponents = (post, metrics) => {
     const { totalDaysPayable } = metrics;
-    // Standard daily rate assumption (Month = 30 days)
     const dailyRate = 1 / 30; 
 
     const salaryComponents = {
@@ -192,7 +193,6 @@ const calculateSalaryComponents = (post, metrics) => {
         salaryComponents.perquisites
     ) || 0;
 
-    // --- PF & ESI Logic ---
     if (post.isPfPayable) {
         const pfBasis = Math.min(salaryComponents.basicSalary, 15000);
         salaryComponents.epfEmployeeContribution = roundToTwo(pfBasis * 0.12);
@@ -203,8 +203,8 @@ const calculateSalaryComponents = (post, metrics) => {
     }
 
     if (post.isEsiPayable) {
-        salaryComponents.esiEmployeeContribution = roundToTwo(salaryComponents.grossSalary * 0.0075); 
-        salaryComponents.esiEmployerContribution = roundToTwo(salaryComponents.grossSalary * 0.0325); 
+        salaryComponents.esiEmployeeContribution = roundToTwo(salaryComponents.grossSalary * 0.0075);
+        salaryComponents.esiEmployerContribution = roundToTwo(salaryComponents.grossSalary * 0.0325);
     } else {
         salaryComponents.esiEmployeeContribution = 0;
         salaryComponents.esiEmployerContribution = 0;
@@ -223,28 +223,26 @@ const calculateSalaryComponents = (post, metrics) => {
     return roundAllValues(salaryComponents);
 };
 
+
+
+
 const calculateEmployeePayrollData = async (employee, periodData) => {
     const payrollType = employee.post.payrollType;
     const isSundayHoliday = payrollType && payrollType.includes('With_Sunday_Holiday');
 
-    // --- UPDATED FETCHING LOGIC ---
     let attendanceQuery = { employeeId: employee._id };
     
     if (periodData.periodKey === 'week') {
-        // STRICTLY use the 'week' ID field. 
-        // We do NOT use date range to query DB for weekly payroll to ensure consistency.
         attendanceQuery.week = periodData.periodValue; 
     } else if (periodData.periodKey === 'month') {
         attendanceQuery.month = periodData.periodValue;
     } else {
-        // Fallback
         attendanceQuery.date = { 
             $gte: periodData.startDate, 
             $lte: periodData.endDate 
         };
     }
 
-    // Fetch records
     const attendanceRecords = await Attendance.find(attendanceQuery).populate({
         path: 'leaveId',
         populate: {
@@ -253,9 +251,7 @@ const calculateEmployeePayrollData = async (employee, periodData) => {
         },
     });
 
-    // Pass records to calculator
-    // Note: We still pass startDate/endDate here because the calculator needs to 
-    // iterate through specific calendar days to identify Sundays and Holidays vs Working days.
+    // Pass periodData.startDate/endDate (which are now timezone adjusted Dates)
     const attendanceData = await calculateAttendanceMetrics(
         attendanceRecords,
         periodData.startDate,
