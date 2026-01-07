@@ -6,16 +6,18 @@ import { Payroll } from '../models/payroll.model.js';
 import { Holiday } from '../models/holidays.model.js';
 import dayjs from 'dayjs';
 import isoWeek from 'dayjs/plugin/isoWeek.js';
+import weekday from 'dayjs/plugin/weekday.js'; // Added for extra safety
 import { getCache, setCache, removeCache, removeCachePattern } from "../utils/cache.js";
 import { invalidateDashboardCache } from './dashboard.controller.js';
 
-// Extend dayjs with ISO Week plugin for accurate weekly calculations
+// Extend dayjs plugins
 dayjs.extend(isoWeek);
+dayjs.extend(weekday);
 
 // Cache Keys Configuration
 const CACHE_KEY = {
-  PREFIX: "pay_",              // Single ID: pay_12345
-  LIST_PREFIX: "pay_list_"     // Query lists
+    PREFIX: "pay_",
+    LIST_PREFIX: "pay_list_"
 };
 
 // ------------------------------------------------------------------
@@ -23,19 +25,27 @@ const CACHE_KEY = {
 // ------------------------------------------------------------------
 
 const getWeekDateRange = (weekId) => {
-    // weekId format: "WWYY" e.g., "0225" (2nd week of 2025)
+    // weekId format: "WWYY" e.g., "0225"
     const week = parseInt(weekId.substring(0, 2));
     const yearShort = parseInt(weekId.substring(2, 4));
     const year = 2000 + yearShort;
     
-    // Construct date using ISO week (Monday start)
-    // We strictly force startOf('isoWeek') to ensure it anchors to Monday
-    const d = dayjs().year(year).isoWeek(week).startOf('isoWeek'); 
+    // 1. Initialize dayjs object with the target year
+    // 2. Set the ISO Week number
+    // 3. Force the day to be ISO Weekday 1 (Monday)
+    // 4. Normalize time to start of day to avoid timezone offsets
+    const start = dayjs()
+        .year(year)
+        .isoWeek(week)
+        .isoWeekday(1) 
+        .hour(0).minute(0).second(0).millisecond(0);
     
-    const start = d.toDate();
-    const end = d.endOf('isoWeek').toDate(); // Sunday
+    const end = start.add(6, 'day').endOf('day');
     
-    return { start, end };
+    return { 
+        start: start.toDate(), 
+        end: end.toDate() 
+    };
 };
 
 const roundToTwo = (num) => {
@@ -67,7 +77,7 @@ const calculateTotalDeductions = (components, taxes) => {
 // ------------------------------------------------------------------
 
 const calculateAttendanceMetrics = async (attendanceRecords, startDate, endDate, isSundayHoliday) => {
-    let workingDays = 0;   // Scheduled working days (excluding holidays)
+    let workingDays = 0;   
     let presentDays = 0;
     let paidLeaveDays = 0;
     let unpaidLeave = 0;
@@ -78,29 +88,30 @@ const calculateAttendanceMetrics = async (attendanceRecords, startDate, endDate,
     const end = dayjs(endDate);
     const totalDays = end.diff(start, 'day') + 1;
 
-    // 1. Fetch Holidays within range
+    // 1. Fetch Holidays within range (For logic calculation)
     const holidayRecords = await Holiday.find({
         date: { $gte: start.toDate(), $lte: end.toDate() },
         isActive: true
     });
     
-    // Create a Set of holiday date strings for O(1) lookup
+    // Format holidays to YYYY-MM-DD for comparison
     const holidaySet = new Set(holidayRecords.map(h => dayjs(h.date).format('YYYY-MM-DD')));
 
     // 2. Map Attendance Records for O(1) lookup
+    // Using Map allows us to robustly match dates even if time components differ slightly
     const attendanceMap = new Map();
     attendanceRecords.forEach(rec => {
         const d = dayjs(rec.date).format('YYYY-MM-DD');
         attendanceMap.set(d, rec);
     });
 
-    // 3. Iterate Day-by-Day (Single Pass)
+    // 3. Iterate Day-by-Day (Strict 7 Day Loop for Weekly, ~30 for Monthly)
     for (let i = 0; i < totalDays; i++) {
         const current = start.add(i, 'day');
         const dateString = current.format('YYYY-MM-DD');
-        const dayOfWeek = current.day(); // 0 is Sunday
+        const dayOfWeek = current.day(); // 0 is Sunday, 1 is Monday...
         
-        // Priority 1: Check Official Holiday
+        // Priority 1: Check Official Holiday (Global Holidays)
         if (holidaySet.has(dateString)) {
             holidays++;
             continue; 
@@ -108,14 +119,14 @@ const calculateAttendanceMetrics = async (attendanceRecords, startDate, endDate,
         
         // Priority 2: Check Sunday Logic (based on payrollType)
         if (dayOfWeek === 0 && isSundayHoliday) {
-            holidays++; // Sunday is a paid holiday
+            holidays++; 
             continue;
         } 
 
         // If not a holiday, it is a scheduled working day
         workingDays++;
 
-        // Priority 3: Check Attendance (Present or Leave)
+        // Priority 3: Check Attendance (Fetch from the Map created via Week ID query)
         const record = attendanceMap.get(dateString);
 
         if (record) {
@@ -131,17 +142,15 @@ const calculateAttendanceMetrics = async (attendanceRecords, startDate, endDate,
                 presentDays += (record.attendancePercentage || 0) / 100;
             }
         } else {
-            // No record on a working day -> Absent
+            // No record found in the set fetched by Week ID -> Absent
             absent++;
         }
     }
 
     // 4. Calculate Payables
-    // Paid Leave is strictly PAYABLE
     const totalDaysPayable = presentDays + paidLeaveDays + holidays;
     const totalDaysNonPayable = unpaidLeave + absent;
     
-    // Attendance % (Present / Scheduled Working Days)
     const attendancePercentage = workingDays > 0 ? (presentDays / workingDays) * 100 : 0;
 
     return {
@@ -157,12 +166,14 @@ const calculateAttendanceMetrics = async (attendanceRecords, startDate, endDate,
     };
 };
 
+
+
+
 const calculateSalaryComponents = (post, metrics) => {
     const { totalDaysPayable } = metrics;
     // Standard daily rate assumption (Month = 30 days)
     const dailyRate = 1 / 30; 
 
-    // Calculate prorated amounts based on Payable Days
     const salaryComponents = {
         basicSalary: calculateProrated(post.salary.basic || 0, totalDaysPayable, dailyRate) || 0,
         houseRentAllowance: calculateProrated(post.salary.houseRentAllowance || 0, totalDaysPayable, dailyRate) || 0,
@@ -180,9 +191,8 @@ const calculateSalaryComponents = (post, metrics) => {
         salaryComponents.perquisites
     ) || 0;
 
-    // --- PF Calculation Logic ---
+    // --- PF & ESI Logic ---
     if (post.isPfPayable) {
-        // Cap Basic at 15000 for PF calculation standard
         const pfBasis = Math.min(salaryComponents.basicSalary, 15000);
         salaryComponents.epfEmployeeContribution = roundToTwo(pfBasis * 0.12);
         salaryComponents.epfEmployerContribution = roundToTwo(pfBasis * 0.13);
@@ -191,19 +201,16 @@ const calculateSalaryComponents = (post, metrics) => {
         salaryComponents.epfEmployerContribution = 0;
     }
 
-    // --- ESI Calculation Logic ---
     if (post.isEsiPayable) {
-        salaryComponents.esiEmployeeContribution = roundToTwo(salaryComponents.grossSalary * 0.0075); // 0.75%
-        salaryComponents.esiEmployerContribution = roundToTwo(salaryComponents.grossSalary * 0.0325); // 3.25%
+        salaryComponents.esiEmployeeContribution = roundToTwo(salaryComponents.grossSalary * 0.0075); 
+        salaryComponents.esiEmployerContribution = roundToTwo(salaryComponents.grossSalary * 0.0325); 
     } else {
         salaryComponents.esiEmployeeContribution = 0;
         salaryComponents.esiEmployerContribution = 0;
     }
 
-    // Total Deductions
     salaryComponents.totalDeductions = calculateTotalDeductions(salaryComponents, post.salary.taxes);
 
-    // Net Salary
     salaryComponents.netSalary = roundToTwo(
         salaryComponents.grossSalary + 
         salaryComponents.bonus + 
@@ -216,28 +223,27 @@ const calculateSalaryComponents = (post, metrics) => {
 };
 
 const calculateEmployeePayrollData = async (employee, periodData) => {
-    // 1. Determine Sunday Logic based on Post Payroll Type
     const payrollType = employee.post.payrollType;
     const isSundayHoliday = payrollType && payrollType.includes('With_Sunday_Holiday');
 
-    // 2. Fetch Attendance
+    // --- UPDATED FETCHING LOGIC ---
     let attendanceQuery = { employeeId: employee._id };
     
-    if (periodData.periodKey === 'month') {
+    if (periodData.periodKey === 'week') {
+        // STRICTLY use the 'week' ID field. 
+        // We do NOT use date range to query DB for weekly payroll to ensure consistency.
+        attendanceQuery.week = periodData.periodValue; 
+    } else if (periodData.periodKey === 'month') {
         attendanceQuery.month = periodData.periodValue;
-    } else if (periodData.periodKey === 'week') {
-        // UPDATED: Use the explicit 'week' field from Attendance schema
-        // This ensures we get exactly the records stamped with this week ID, 
-        // regardless of date calculation inconsistencies.
-        attendanceQuery.week = periodData.periodValue;
     } else {
-        // Fallback (though this path shouldn't be reached with current logic)
+        // Fallback
         attendanceQuery.date = { 
             $gte: periodData.startDate, 
             $lte: periodData.endDate 
         };
     }
 
+    // Fetch records
     const attendanceRecords = await Attendance.find(attendanceQuery).populate({
         path: 'leaveId',
         populate: {
@@ -246,9 +252,9 @@ const calculateEmployeePayrollData = async (employee, periodData) => {
         },
     });
 
-    // 3. Calculate Metrics
-    // We still pass startDate/endDate here to allow the loop to determine 
-    // which days are Sundays or Holidays within that week frame.
+    // Pass records to calculator
+    // Note: We still pass startDate/endDate here because the calculator needs to 
+    // iterate through specific calendar days to identify Sundays and Holidays vs Working days.
     const attendanceData = await calculateAttendanceMetrics(
         attendanceRecords,
         periodData.startDate,
@@ -256,7 +262,6 @@ const calculateEmployeePayrollData = async (employee, periodData) => {
         isSundayHoliday
     );
 
-    // 4. Calculate Salary
     const salaryComponents = calculateSalaryComponents(employee.post, attendanceData);
 
     return { attendanceData, salaryComponents };
@@ -342,21 +347,19 @@ const generateMonthlyPayroll = asyncHandler(async (req, res) => {
 
 // 2. Generate WEEKLY Payroll
 const generateWeeklyPayroll = asyncHandler(async (req, res) => {
-    const { week } = req.body; // WWYY (Site removed as per request)
+    const { week } = req.body; // WWYY
 
     if (!week || !/^\d{4}$/.test(week)) {
         return res.status(400).json(new ApiResponse(400, null, "Valid Week (WWYY) is required", false));
     }
 
-    // This generates the strict Monday-Sunday range for determining Holidays/Sundays
+    // Calculate range strictly for the "Logic Loop" (to detect holidays/Sundays)
     const { start, end } = getWeekDateRange(week);
     
-    // FILTER: Employees with valid working statuses
     const allEmployees = await Employee.find({ 
         status: { $in: ['Active', 'PartTime', 'Contractual', 'Probation'] } 
     }).populate('post');
 
-    // FILTER: Only keep employees with 'Weekly' payroll types
     const weeklyEmployees = allEmployees.filter(emp => 
         emp.post?.payrollType && emp.post.payrollType.startsWith('Weekly')
     );
@@ -369,16 +372,18 @@ const generateWeeklyPayroll = asyncHandler(async (req, res) => {
 
     for (const employee of weeklyEmployees) {
         try {
+            // We pass periodValue: week. This ensures calculateEmployeePayrollData
+            // uses the 'week' ID for the DB query, ensuring 100% consistency with Attendance.
             const { attendanceData, salaryComponents } = await calculateEmployeePayrollData(employee, {
                 startDate: start,
                 endDate: end,
                 periodKey: 'week',
-                periodValue: week
+                periodValue: week 
             });
 
             const payrollData = {
                 employee: employee._id,
-                month: week,
+                month: week, // Storing week ID in the 'month' field as per schema convention or change schema to support 'periodId'
                 type: 'Weekly',
                 attendance: attendanceData,
                 earnings: salaryComponents,
@@ -406,13 +411,11 @@ const generateWeeklyPayroll = asyncHandler(async (req, res) => {
         }
     }
 
-    // [CACHE INVALIDATION]
     await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
     await invalidateDashboardCache();
 
     return res.status(200).json(new ApiResponse(200, results, "Weekly payroll processing completed", true));
 });
-
 
 // 3. Process Single Employee
 const processEmployeePayroll = asyncHandler(async (req, res) => {
@@ -431,7 +434,7 @@ const processEmployeePayroll = asyncHandler(async (req, res) => {
     let periodData = {};
 
     if (payrollType && payrollType.startsWith('Monthly')) {
-        if (!month) return res.status(400).json(new ApiResponse(400, null, "Month (YYYY-MM) is required for this employee", false));
+        if (!month) return res.status(400).json(new ApiResponse(400, null, "Month (YYYY-MM) is required", false));
         periodData = {
             startDate: dayjs(month).startOf('month').toDate(),
             endDate: dayjs(month).endOf('month').toDate(),
@@ -439,7 +442,7 @@ const processEmployeePayroll = asyncHandler(async (req, res) => {
             periodValue: month
         };
     } else if (payrollType && payrollType.startsWith('Weekly')) {
-        if (!week) return res.status(400).json(new ApiResponse(400, null, "Week (WWYY) is required for this employee", false));
+        if (!week) return res.status(400).json(new ApiResponse(400, null, "Week (WWYY) is required", false));
         const { start, end } = getWeekDateRange(week);
         periodData = {
             startDate: start,
@@ -448,7 +451,7 @@ const processEmployeePayroll = asyncHandler(async (req, res) => {
             periodValue: week
         };
     } else {
-        return res.status(400).json(new ApiResponse(400, null, "Invalid or missing Payroll Type configuration", false));
+        return res.status(400).json(new ApiResponse(400, null, "Invalid Payroll Type", false));
     }
 
     const { attendanceData, salaryComponents } = await calculateEmployeePayrollData(employee, periodData);
@@ -476,10 +479,8 @@ const processEmployeePayroll = asyncHandler(async (req, res) => {
         { upsert: true, new: true }
     );
 
-    // [CACHE INVALIDATION]
     await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
     await invalidateDashboardCache();
-    
 
     return res.status(200).json(new ApiResponse(200, payroll, "Payroll processed successfully", true));
 });
