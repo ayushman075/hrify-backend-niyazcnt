@@ -11,9 +11,11 @@ import { ShiftRoster } from "../models/shiftRoster.model.js";
 import Attendance from "../models/attendance.model.js"; 
 
 // Services
-import { identifyUserFromFace } from "../services/azureFace.service.js";
+// [Updated] Ensure this imports from your new AWS service file (or the updated azureFace.service.js)
+import { identifyUserFromFace } from "../services/azureFace.service.js"; 
 import { removeCache, removeCachePattern } from "../utils/cache.js";
 import { invalidateDashboardCache } from "../controllers/dashboard.controller.js";
+
 
 // Cache Constants
 const CACHE_KEY = {
@@ -38,6 +40,7 @@ const getWeekId = (dateInput) => {
 
 const calculateAttendancePercentage = (post, date, punchInTime, punchOutTime, scheduledShift) => {
   if (!punchOutTime) return 0; 
+  if (!punchInTime) return 0;
 
   let scheduledMinutes = 0;
 
@@ -45,7 +48,6 @@ const calculateAttendancePercentage = (post, date, punchInTime, punchOutTime, sc
   if (scheduledShift && scheduledShift.shiftId) {
     const shiftStartTime = scheduledShift.shiftId.startTime;
     const shiftEndTime = scheduledShift.shiftId.endTime;
-    // Using simple date string concatenation for robust parsing
     const dateStr = new Date(date).toDateString(); 
     scheduledMinutes = Math.floor((new Date(`${dateStr} ${shiftEndTime}`) - new Date(`${dateStr} ${shiftStartTime}`)) / 60000);
   } 
@@ -55,35 +57,29 @@ const calculateAttendancePercentage = (post, date, punchInTime, punchOutTime, sc
   }
 
   // Avoid division by zero
-  if (scheduledMinutes === 0) return 0;
+  if (scheduledMinutes <= 0) return 0;
 
   const workedMinutes = Math.floor((new Date(punchOutTime) - new Date(punchInTime)) / 60000);
 
-  // Case A: Overtime or Exact Match (Bonus or Full Score)
+  // Case A: Bonus / Full Score
   if (workedMinutes >= scheduledMinutes) {
     return Math.round((workedMinutes / scheduledMinutes) * 100);
   }
 
-  // Case B: Undertime (Worked Less)
+  // Case B: Undertime Logic
   const absDifference = scheduledMinutes - workedMinutes;
+  // Safety: Ensure lateAttendanceMetrics exists
   const thresholds = post?.lateAttendanceMetrics || [];
 
-  // Sort metrics descending to find the largest allowance first
   const sortedMetrics = thresholds.sort((a, b) => b.allowedMinutes - a.allowedMinutes);
   const largestMetric = sortedMetrics.length > 0 ? sortedMetrics[0] : null;
 
-  // RULE CHANGE: 
-  // If NO metrics exist OR the gap is larger than the biggest allowed gap:
-  // Use Simple Percentage.
   if (!largestMetric || absDifference > largestMetric.allowedMinutes) {
      return Math.round((workedMinutes / scheduledMinutes) * 100);
   }
 
-  // Case C: Small Gap (Within Penalty Thresholds)
-  // Apply specific deduction logic
+  // Case C: Penalty Logic
   let attendancePercentage = 100;
-  
-  // Find the matching bucket (e.g., > 15 mins late)
   const applicableLateMetric = sortedMetrics.find(metric => absDifference > metric.allowedMinutes);
 
   if (applicableLateMetric) {
@@ -98,11 +94,10 @@ const calculateAttendancePercentage = (post, date, punchInTime, punchOutTime, sc
 // ==========================================
 
 export const worker = new Worker('attendanceQueue', async job => {
-    // 1. Extract Payload
     const { filePath, checkInId, type, timestamp } = job.data;
-    
-    // 2. Determine Event Time
     const eventTime = timestamp ? new Date(timestamp) : new Date();
+        console.log("4")
+        
 
     console.log(`[Worker] Processing ${type.toUpperCase()} | CheckIn ID: ${checkInId} | Time: ${eventTime.toISOString()}`);
 
@@ -110,44 +105,31 @@ export const worker = new Worker('attendanceQueue', async job => {
         // ---------------------------------------------------------
         // A. Identify Face
         // ---------------------------------------------------------
+        console.log("5")
+
         const result = await identifyUserFromFace(filePath);
         if (!result.identified) throw new Error(result.reason || "Face not recognized");
 
-        const faceId = result.azurePersonId; 
-        console.log(`[Worker] Face++ ID: ${faceId}`);
+        // [Updated Log] Reflecting AWS terminology
+        const personId = result.azurePersonId; 
+        console.log(`[Worker] Identified Person ID: ${personId}`);
+        console.log("6")
 
         // ---------------------------------------------------------
-        // B. Find Employee & User (DIRECT LOOKUP)
+        // B. Find Employee
         // ---------------------------------------------------------
-        
-        // 1. Find Employee directly by Face ID (Populate 'post' for calculation later)
-        const employeeDetails = await Employee.findOne({ azurePersonId: faceId }).populate("post");
+        const employeeDetails = await Employee.findOne({ azurePersonId: personId }).populate("post");
 
         if (!employeeDetails) {
-            throw new Error(`Face recognized (ID: ${faceId}), but no Employee record found with this ID.`);
+            throw new Error(`Face recognized (ID: ${personId}), but no Employee record found.`);
         }
 
         console.log(`[Worker] Matched Employee: ${employeeDetails.firstName} ${employeeDetails.lastName}`);
 
-        // 2. Find the User account linked to this Employee
-        // (Attendance creates rely on User ID usually, but Attendance model actually uses 'employeeId' field 
-        // which typically refers to the Employee Document ID, not User Document ID, depending on your schema.
-        // Assuming your Attendance Model 'employeeId' ref points to 'Employee' collection, we use employeeDetails._id directly.
-        // If it points to 'User', keep this lookup.)
-        
-        // Let's assume Attendance model links to Employee Collection (Standard HR Logic).
-        // If your system links Attendance to User Collection, uncomment the next lines:
-        /*
-        const user = await User.findOne({ employeeId: employeeDetails._id });
-        if (!user) throw new Error("Employee found, but no User account linked.");
-        const targetId = user._id; 
-        */
-
-        // Current Assumption: Attendance.employeeId -> Employee Collection
         const targetId = employeeDetails._id; 
 
         // ---------------------------------------------------------
-        // C. Prepare Calculation Context
+        // C. Prepare Context
         // ---------------------------------------------------------
         const todayStart = moment(eventTime).startOf('day').toDate();
         const monthStr = moment(eventTime).format('YYYY-MM'); 
@@ -174,7 +156,6 @@ export const worker = new Worker('attendanceQueue', async job => {
         
         if (type === 'in') {
             if (attendance) {
-                // Already punched in
                 await CheckIn.findByIdAndUpdate(checkInId, {
                     status: "SUCCESS",
                     message: "You are already clocked in today.",
@@ -182,7 +163,6 @@ export const worker = new Worker('attendanceQueue', async job => {
                     read: false
                 });
             } else {
-                // New Punch In
                 await Attendance.create({
                     employeeId: targetId,
                     date: todayStart,
@@ -199,44 +179,48 @@ export const worker = new Worker('attendanceQueue', async job => {
                     read: false
                 });
                 
-                // [CACHE INVALIDATION]
                 await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
-                  await invalidateDashboardCache();
-                
+                await invalidateDashboardCache();
             }
         } 
         else if (type === 'out') {
             if (attendance) {
-                // Punch Out Logic
                 attendance.punchOutTime = eventTime;
 
-                // [CALCULATION] Calculate Percentage
-                const percentage = calculateAttendancePercentage(
-                    employeeDetails.post,
-                    todayStart,
-                    attendance.punchInTime,
-                    eventTime,
-                    scheduledShift
-                );
+                // [Safety] Check if post exists before calculating
+                if (employeeDetails.post) {
+                    const percentage = calculateAttendancePercentage(
+                        employeeDetails.post,
+                        todayStart,
+                        attendance.punchInTime,
+                        eventTime,
+                        scheduledShift
+                    );
+                    attendance.attendancePercentage = percentage;
+                    await CheckIn.findByIdAndUpdate(checkInId, {
+                        status: "SUCCESS",
+                        message: `Goodbye! Attendance: ${percentage}%`,
+                        identifiedEmployeeId: targetId,
+                        read: false
+                    });
+                } else {
+                    // Fallback if no Post assigned
+                    attendance.attendancePercentage = 0; 
+                    await CheckIn.findByIdAndUpdate(checkInId, {
+                        status: "SUCCESS",
+                        message: `Goodbye! (No Post assigned for calculation)`,
+                        identifiedEmployeeId: targetId,
+                        read: false
+                    });
+                }
 
-                attendance.attendancePercentage = percentage;
                 await attendance.save();
 
-                await CheckIn.findByIdAndUpdate(checkInId, {
-                    status: "SUCCESS",
-                    message: `Goodbye! Attendance: ${percentage}%`,
-                    identifiedEmployeeId: targetId,
-                    read: false
-                });
-
-                // [CACHE INVALIDATION]
                 await removeCache(`${CACHE_KEY.PREFIX}${attendance._id}`);
                 await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
-                  await invalidateDashboardCache();
-                
+                await invalidateDashboardCache();
 
             } else {
-                // Corner Case: Out without In
                 console.log(`⚠️ Corner Case: Punch Out with no In.`);
                 
                 await Attendance.create({
@@ -256,7 +240,6 @@ export const worker = new Worker('attendanceQueue', async job => {
                     read: false
                 });
 
-                // [CACHE INVALIDATION]
                 await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
             }
         }
@@ -276,5 +259,5 @@ export const worker = new Worker('attendanceQueue', async job => {
 
 }, {
     connection: redis,
-    limiter: { max: 10, duration: 1000 }
+    limiter: { max: 10, duration: 10000 }
 });

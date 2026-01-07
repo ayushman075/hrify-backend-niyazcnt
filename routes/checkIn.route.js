@@ -5,16 +5,16 @@ import { getCheckInStatus, processAttendance } from "../controllers/checkIn.cont
 
 const checkInRouter = express.Router();
 
-// 1. Configure Multer (Temp Storage)
-const upload = multer({ dest: "uploads/face/" }); 
+// 1. Configure Multer (RAM Storage with Limits)
+const upload = multer({ 
+    storage: multer.memoryStorage(),
+    limits: { 
+        fileSize: 3 * 1024 * 1024 // 3MB Limit (Safe for Render Free Tier)
+    } 
+}); 
 
-// 2. Define Routes
-// Protect routes if needed, e.g., checkInRouter.use(ClerkExpressRequireAuth());
-
-// POST: Upload image -> Returns { checkInId: "..." }
+// Routes
 checkInRouter.post("/attendance", ClerkExpressRequireAuth(), upload.single("image"), processAttendance);
-
-// GET: Poll status -> Returns { status: "SUCCESS", identifiedEmployee: { fullName: "..." } }
 checkInRouter.get("/attendance/status/:id", ClerkExpressRequireAuth(), getCheckInStatus);
 
 export default checkInRouter;

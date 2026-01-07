@@ -1,202 +1,166 @@
-import axios from 'axios';
-import fs from 'fs';
-import FormData from 'form-data';
+import { 
+    RekognitionClient, 
+    IndexFacesCommand, 
+    SearchFacesByImageCommand,
+    DeleteFacesCommand
+} from "@aws-sdk/client-rekognition";
+import fs from "fs/promises";
 import dotenv from 'dotenv';
+
+// 👇 IMPORT EMPLOYEE MODEL (Required for Duplicate Check)
+import { Employee } from "../models/employee.model.js"; 
 
 dotenv.config();
 
-const API_KEY = process.env.FACE_API_KEY;
-const API_SECRET = process.env.FACE_API_SECRET;
-const BASE_URL = process.env.FACE_ENDPOINT || 'https://api-us.faceplusplus.com/facepp/v3';
-
-// Custom Name for the group of faces
-const CUSTOM_FACESET_ID = 'hrify_employees_group_v2'; 
-
-const getCommonParams = () => ({
-    api_key: API_KEY,
-    api_secret: API_SECRET,
+const client = new RekognitionClient({ 
+    region: process.env.AWS_REGION || 'us-east-1',
+    credentials: {
+        accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+        secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY
+    }
 });
 
-// ==========================================
-// 0. Helper: Robust Request Wrapper
-// ==========================================
-const makeRequestWithRetry = async (url, data, retries = 3) => {
-    try {
-        const response = await axios.post(url, data, {
-            headers: data.getHeaders ? data.getHeaders() : undefined 
-        });
-        return response.data;
-    } catch (error) {
-        const errMsg = error.response?.data?.error_message;
-        
-        // Rate Limit Handling (Wait 2s and retry)
-        if (errMsg === 'CONCURRENCY_LIMIT_EXCEEDED' && retries > 0) {
-            console.log(`⚠️ Rate Limit Hit. Retrying in 2s... (${retries} left)`);
-            await new Promise(res => setTimeout(res, 2000));
-            return makeRequestWithRetry(url, data, retries - 1);
-        }
-        throw error;
-    }
-};
+const COLLECTION_ID = "hrify-employees-group-v2";
 
-// ==========================================
-// 1. Helper: Force Create FaceSet
-// ==========================================
-const ensureFaceSetExists = async () => {
-    try {
-        const createParams = new URLSearchParams({
-            ...getCommonParams(),
-            display_name: "HRify Employees",
-            outer_id: CUSTOM_FACESET_ID,
-            force_merge: '0'
-        });
-        
-        await axios.post(`${BASE_URL}/faceset/create`, createParams);
-        console.log("✅ FaceSet Created Successfully");
-    } catch (error) {
-        // If it already exists, that is GOOD. We ignore this error.
-        const msg = error.response?.data?.error_message;
-        if (msg === 'FACESET_EXIST') {
-            return; 
-        }
-        if (msg === 'CONCURRENCY_LIMIT_EXCEEDED') {
-            await new Promise(res => setTimeout(res, 2000));
-            return ensureFaceSetExists();
-        }
-        console.error("FaceSet Init Warning:", msg);
-    }
-};
-
-// ==========================================
-// 2. Identify User
-// ==========================================
+// =========================================================
+// 1. IDENTIFY USER (For Attendance)
+// =========================================================
 export const identifyUserFromFace = async (imagePath) => {
     try {
-        const formData = new FormData();
-        formData.append('api_key', API_KEY);
-        formData.append('api_secret', API_SECRET);
-        formData.append('image_file', fs.createReadStream(imagePath));
-        formData.append('outer_id', CUSTOM_FACESET_ID);
-        formData.append('return_result_count', 1);
+        const imageBytes = await fs.readFile(imagePath);
 
-        const data = await makeRequestWithRetry(`${BASE_URL}/search`, formData);
+        const command = new SearchFacesByImageCommand({
+            CollectionId: COLLECTION_ID,
+            Image: { Bytes: imageBytes },
+            MaxFaces: 1,
+            FaceMatchThreshold: 80
+        });
 
-        if (!data.faces || data.faces.length === 0) {
-            return { identified: false, reason: "No face detected" };
-        }
+        const response = await client.send(command);
 
-        const bestMatch = data.results[0];
-
-        // 75% Confidence Threshold
-        if (!bestMatch || bestMatch.confidence < 75) {
+        if (!response.FaceMatches || response.FaceMatches.length === 0) {
             return { identified: false, reason: "Face not recognized" };
         }
 
         return {
             identified: true,
-            azurePersonId: bestMatch.user_id,
-            confidence: bestMatch.confidence
+            azurePersonId: response.FaceMatches[0].Face.ExternalImageId, 
+            confidence: response.FaceMatches[0].Similarity
         };
 
     } catch (error) {
-        if (error.response?.data?.error_message === 'INVALID_OUTER_ID') {
-            return { identified: false, reason: "System empty (No FaceSet)" };
+        // --- HANDLE LOGICAL ERRORS (Return 200 Friendly Responses) ---
+        
+        // 1. No faces in image (User uploaded a wall/blank photo)
+        if (error.name === 'InvalidParameterException' && error.message.includes('no faces')) {
+            return { identified: false, reason: "No face detected in the image." };
         }
-        return { identified: false, reason: "Service Error" };
+
+        // 2. Collection doesn't exist yet (First run)
+        if (error.name === 'ResourceNotFoundException') {
+            return { identified: false, reason: "System empty (No faces registered yet)." };
+        }
+
+        // 3. File is not an image
+        if (error.name === 'InvalidImageFormatException') {
+            return { identified: false, reason: "Invalid image format." };
+        }
+
+        // --- HANDLE SYSTEM ERRORS (Throw 500) ---
+        console.error("AWS System Error:", error); 
+        throw new Error(`AWS Error: ${error.message}`);
     }
 };
 
-// ==========================================
-// 3. Create Person (Initialize)
-// ==========================================
-export const createAzurePerson = async (name) => {
-    // Generate a unique ID for the user
-    return `user_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-};
-
-// ==========================================
-// 4. Add Face (Returns Token)
-// ==========================================
+// =========================================================
+// 2. ADD FACE (Registration - With Duplicate Check)
+// =========================================================
 export const addFaceToAzurePerson = async (personId, imagePath) => {
     try {
-        // Step A: Detect Face
-        const formData = new FormData();
-        formData.append('api_key', API_KEY);
-        formData.append('api_secret', API_SECRET);
-        formData.append('image_file', fs.createReadStream(imagePath));
+        const imageBytes = await fs.readFile(imagePath);
 
-        const detectRes = await makeRequestWithRetry(`${BASE_URL}/detect`, formData);
-
-        if (!detectRes.faces || detectRes.faces.length === 0) {
-            throw new Error("No face detected in photo");
-        }
-
-        const faceToken = detectRes.faces[0].face_token;
-
-        // Step B: Add to FaceSet
-        const addParams = new URLSearchParams({
-            ...getCommonParams(),
-            outer_id: CUSTOM_FACESET_ID,
-            face_tokens: faceToken
+        // --- STEP A: CHECK FOR DUPLICATES ---
+        // We run a search before adding. If this face exists, we block it.
+        const searchCommand = new SearchFacesByImageCommand({
+            CollectionId: COLLECTION_ID,
+            Image: { Bytes: imageBytes },
+            MaxFaces: 1,
+            FaceMatchThreshold: 95 // Very High threshold to ensure it's definitely the same person
         });
 
+        let duplicateFound = null;
         try {
-            await makeRequestWithRetry(`${BASE_URL}/faceset/addface`, addParams);
-        } catch (error) {
-            const errMsg = error.response?.data?.error_message;
+            const searchResponse = await client.send(searchCommand);
+            if (searchResponse.FaceMatches && searchResponse.FaceMatches.length > 0) {
+                duplicateFound = searchResponse.FaceMatches[0].Face.ExternalImageId;
+            }
+        } catch (err) {
+            // Ignore errors here (e.g. if collection doesn't exist yet, we just proceed to add)
+        }
 
-            // If FaceSet missing, create it and retry
-            if (errMsg === 'INVALID_OUTER_ID' || errMsg === 'INVALID_FACESET_TOKEN') {
-                console.log("⚠️ FaceSet missing. Creating now...");
-                await ensureFaceSetExists();
-                await new Promise(res => setTimeout(res, 1000));
-                await makeRequestWithRetry(`${BASE_URL}/faceset/addface`, addParams);
-            } else {
-                throw error;
+        // --- STEP B: IF DUPLICATE FOUND, FETCH OWNER & THROW ERROR ---
+        if (duplicateFound) {
+            // 1. Find who owns this face in MongoDB
+            const existingEmployee = await Employee.findOne({ azurePersonId: duplicateFound });
+
+            if (existingEmployee) {
+                // 2. Construct the specific error message
+                const code = existingEmployee.employeeId || "NoID"; 
+                const name = `${existingEmployee.firstName} ${existingEmployee.lastName || ""}`.trim();
+                
+                // 3. Throw Error (Controller will catch this and send to frontend)
+                throw new Error(`This face is already attached to ${code} - ${name}`);
             }
         }
 
-        // Step C: Link Face to User ID
-        const linkParams = new URLSearchParams({
-            ...getCommonParams(),
-            face_token: faceToken,
-            user_id: personId
-        });
-        await makeRequestWithRetry(`${BASE_URL}/face/setuserid`, linkParams);
+        // --- STEP C: PROCEED TO ADD (If unique) ---
+        const safePersonId = String(personId).replace(/[^a-zA-Z0-9_.\-]/g, "_");
 
-        // *** IMPORTANT: Return the token so we can save it in MongoDB ***
-        return faceToken;
+        const indexCommand = new IndexFacesCommand({
+            CollectionId: COLLECTION_ID,
+            Image: { Bytes: imageBytes },
+            ExternalImageId: safePersonId,
+            DetectionAttributes: ["ALL"]
+        });
+
+        const response = await client.send(indexCommand);
+        
+        if (!response.FaceRecords || response.FaceRecords.length === 0) {
+            throw new Error("No face detected in image");
+        }
+        
+        return response.FaceRecords[0].Face.FaceId;
 
     } catch (error) {
-        console.error("Add Face Error:", error.response?.data || error.message);
-        throw new Error("Failed to add face to Face++");
+        // If it's our custom duplicate error, re-throw it directly so the message stays intact
+        if (error.message.includes("already attached")) {
+            throw error;
+        }
+        throw new Error(`AWS Add Error: ${error.message}`);
     }
 };
 
-// ==========================================
-// 5. Remove Face (New Function)
-// ==========================================
+// =========================================================
+// 3. HELPER FUNCTIONS
+// =========================================================
+
+export const createAzurePerson = async (name) => {
+    // Generates a unique ID string for AWS ExternalImageId
+    return `user_${Date.now()}_${Math.floor(Math.random() * 1000)}`; 
+};
+
 export const removeFaceFromAzurePerson = async (faceToken) => {
     if (!faceToken) return;
-
-    try {
-        const params = new URLSearchParams({
-            ...getCommonParams(),
-            outer_id: CUSTOM_FACESET_ID,
-            face_tokens: faceToken
-        });
-
-        await makeRequestWithRetry(`${BASE_URL}/faceset/removeface`, params);
-        console.log(`✅ Removed old face token: ${faceToken}`);
-        return true;
-    } catch (error) {
-        // We log the warning but don't throw, so the update process continues
-        console.warn("⚠️ Remove Face Warning:", error.response?.data?.error_message || error.message);
-        return false;
+    try { 
+        await client.send(new DeleteFacesCommand({ 
+            CollectionId: COLLECTION_ID, 
+            FaceIds: [faceToken] 
+        })); 
+        return true; 
+    } catch (e) { 
+        return false; 
     }
 };
 
-export const trainAzureGroup = async () => {
-    // Face++ auto-trains, this is just for compatibility if needed
-    return true;
-};
+// No-op for AWS (Indexing is automatic)
+export const trainAzureGroup = async () => { return true; };

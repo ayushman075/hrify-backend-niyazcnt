@@ -18,7 +18,7 @@ const checkInSchema = new mongoose.Schema({
     message: { type: String }, 
     identifiedEmployeeId: { 
         type: mongoose.Schema.Types.ObjectId, 
-        ref: 'User' 
+        ref: 'Employee' 
     },
         
     createdAt: { type: Date, default: Date.now } 
