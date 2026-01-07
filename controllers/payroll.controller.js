@@ -9,10 +9,14 @@ import isoWeek from 'dayjs/plugin/isoWeek.js';
 import weekday from 'dayjs/plugin/weekday.js'; // Added for extra safety
 import { getCache, setCache, removeCache, removeCachePattern } from "../utils/cache.js";
 import { invalidateDashboardCache } from './dashboard.controller.js';
+import utc from 'dayjs/plugin/utc.js';
+import timezone from 'dayjs/plugin/timezone.js';
 
 // Extend dayjs plugins
 dayjs.extend(isoWeek);
 dayjs.extend(weekday);
+dayjs.extend(utc);
+dayjs.extend(timezone);
 
 // Cache Keys Configuration
 const CACHE_KEY = {
@@ -30,17 +34,14 @@ const getWeekDateRange = (weekId) => {
     const yearShort = parseInt(weekId.substring(2, 4));
     const year = 2000 + yearShort;
     
-    // 1. Initialize dayjs object with the target year
-    // 2. Set the ISO Week number
-    // 3. Force the day to be ISO Weekday 1 (Monday)
-    // 4. Normalize time to start of day to avoid timezone offsets
-    const start = dayjs()
+    // KEY FIX: Use dayjs.utc() to ignore server timezone completely
+    // We construct the date in UTC directly.
+    const start = dayjs.utc()
         .year(year)
         .isoWeek(week)
-        .isoWeekday(1) 
-        .hour(0).minute(0).second(0).millisecond(0);
+        .startOf('isoWeek'); // This automatically snaps to Monday 00:00:00 UTC
     
-    const end = start.add(6, 'day').endOf('day');
+    const end = start.endOf('isoWeek'); // This snaps to Sunday 23:59:59 UTC
     
     return { 
         start: start.toDate(), 
