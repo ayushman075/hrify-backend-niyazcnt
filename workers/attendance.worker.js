@@ -75,7 +75,7 @@ const calculateAttendancePercentage = (post, date, punchInTime, punchOutTime, sc
   const largestMetric = sortedMetrics.length > 0 ? sortedMetrics[0] : null;
 
   if (!largestMetric || absDifference > largestMetric.allowedMinutes) {
-     return Math.round((workedMinutes / scheduledMinutes) * 100);
+     return min(Math.round((workedMinutes / scheduledMinutes) * 100), applicableLateMetric.attendanceDeductionPercent);
   }
 
   // Case C: Penalty Logic
