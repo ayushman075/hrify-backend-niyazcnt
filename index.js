@@ -42,7 +42,7 @@ import { departmentRouter } from "./routes/department.route.js";
 
 import { emailQueue, pdfGenerationQueue } from "./db/redis.config.js";
 import { emailWorker } from "./workers/mail.worker.js";
-import { pdfGeneratorWorker } from "./workers/pdfGeneration.worker.js";
+//import { pdfGeneratorWorker } from "./workers/pdfGeneration.worker.js";
 import { holidayRouter } from "./routes/holidays.route.js";
 import { noticeRouter } from "./routes/notice.route.js";
 import { dashboardRouter } from "./routes/dashboard.routes.js";
@@ -172,7 +172,7 @@ app.use("/api/v1/biometric",biometricRouter);
 // }
 
 emailWorker;
-pdfGeneratorWorker;
+//pdfGeneratorWorker;
 worker;
 
 const port = process.env.PORT||3005;

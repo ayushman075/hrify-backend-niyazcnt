@@ -204,6 +204,7 @@ async function getSiteWiseStats(todayStart, todayEnd) {
                 foreignField: "_id",
                 as: "employee"
             }
+            
         },
         { $unwind: "$employee" },
         {
@@ -219,7 +220,7 @@ async function getSiteWiseStats(todayStart, todayEnd) {
         },
         {
             $group: {
-                _id: "$siteDetails.name", // Group by Site Name
+                _id: "$siteDetails.siteName", // Group by Site Name
                 presentCount: { $sum: 1 }
             }
         }
@@ -256,7 +257,7 @@ async function getSiteWiseStats(todayStart, todayEnd) {
         },
         {
             $group: {
-                _id: "$siteDetails.name",
+                _id: "$siteDetails.siteName",
                 leaveCount: { $sum: 1 }
             }
         }

@@ -1,14 +1,24 @@
 import express from "express";
-import { ClerkExpressRequireAuth, ClerkExpressWithAuth } from "@clerk/clerk-sdk-node";
-import { generateExperienceLetter, generateJoiningLetter, generateOfferLetter, generatePayrollSlip, getAllPDFLogs, getPDFById } from "../controllers/pdfGeneration.controller.js";
+import { ClerkExpressRequireAuth } from "@clerk/clerk-sdk-node";
+import { 
+    getOfferLetterData, 
+    getJoiningLetterData, 
+    getExperienceLetterData, 
+    getPayrollSlipData 
+} from "../controllers/pdfGeneration.controller.js";
 
 const pdfRouter = express.Router();
 
-pdfRouter.post("/generateOfferLetter/:candidateId",ClerkExpressRequireAuth(),generateOfferLetter)
-pdfRouter.post("/generateJoiningLetter/:employeeId",ClerkExpressRequireAuth(),generateJoiningLetter)
-pdfRouter.post("/generateExperienceLetter/:employeeId",ClerkExpressRequireAuth(),generateExperienceLetter)
-pdfRouter.post("/generatePayroll/:employeeId",ClerkExpressRequireAuth(),generatePayrollSlip)
-pdfRouter.get("/getAll",ClerkExpressRequireAuth(),getAllPDFLogs)
-pdfRouter.get("/getById",ClerkExpressRequireAuth(),getPDFById)
+// Changed from 'generate...' to specific data endpoints
+// We use POST here because we are sending body parameters (dates, specific overrides) 
+// to customize the data response.
 
-export {pdfRouter}
+pdfRouter.post("/offer-letter/:candidateId", ClerkExpressRequireAuth(), getOfferLetterData);
+pdfRouter.post("/joining-letter/:employeeId", ClerkExpressRequireAuth(), getJoiningLetterData);
+pdfRouter.post("/experience-letter/:employeeId", ClerkExpressRequireAuth(), getExperienceLetterData);
+pdfRouter.post("/payroll-slip/:employeeId", ClerkExpressRequireAuth(), getPayrollSlipData);
+
+// REMOVED: getAll and getById routes 
+// (Since we are no longer saving PDF logs to the database)
+
+export { pdfRouter };
