@@ -89,7 +89,7 @@ app.use("/api/v1/pdf",pdfRouter)
 app.use("/api/v1/biometric",biometricRouter);
 
 
-//startAttendanceReconciliationCron()
+startAttendanceReconciliationCron()
 
 
 // try {

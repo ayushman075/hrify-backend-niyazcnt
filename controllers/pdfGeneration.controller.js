@@ -61,11 +61,11 @@ const getOfferLetterData = asyncHandler(async (req, res) => {
         candidateName: candidate.name,
         jobTitle: candidate.post?.title || "N/A",
         department: department || candidate.department,
-        companyName: process.env.COMPANY_NAME || "Niyaz Construction and Trading",
+        companyName: process.env.COMPANY_NAME || "BIMS Hospital",
         companyAddress: process.env.COMPANY_ADDRESS || "Gandhinagar Pada, Jail Road, Balangir, Odisha, 767001",
-        companyWebsite: process.env.COMPANY_WEBSITE || "www.example.com",
-        companyContact: process.env.COMPANY_PHONE || "123-456-7890",
-        companyEmail: process.env.COMPANY_EMAIL || "contact@example.com",
+        companyWebsite: process.env.COMPANY_WEBSITE || "www.bimshospitals.com",
+        companyContact: process.env.COMPANY_PHONE || "8455005505",
+        companyEmail: process.env.COMPANY_EMAIL || "hr@bimshospitals.com",
         companyID: process.env.COMPANY_ID || "123456789",
         joiningDate: joiningDate || candidate.joiningDate,
         salaryDetails: salaryDetails || candidate.offeredSalary,
@@ -96,11 +96,11 @@ const getJoiningLetterData = asyncHandler(async (req, res) => {
         workLocation: workLocation || employee.workLocation,
         generationDate: new Date().toLocaleDateString(),
         // Company details
-        companyName: process.env.COMPANY_NAME || "Niyaz Construction and Trading",
-        companyAddress: process.env.COMPANY_ADDRESS || "Your Address",
-        companyWebsite: process.env.COMPANY_WEBSITE || "www.example.com",
-        companyContact: process.env.COMPANY_PHONE || "123-456-7890",
-        companyEmail: process.env.COMPANY_EMAIL || "contact@example.com",
+        companyName: process.env.COMPANY_NAME || "BIMS Hospital",
+        companyAddress: process.env.COMPANY_ADDRESS || "Gandhinagar Pada, Jail Road, Balangir, Odisha, 767001",
+        companyWebsite: process.env.COMPANY_WEBSITE || "www.bimshospitals.com",
+        companyContact: process.env.COMPANY_PHONE || "8455005505",
+        companyEmail: process.env.COMPANY_EMAIL || "hr@bimshospitals.com",
         companyID: process.env.COMPANY_ID || "123456789",
         base64Logo: getBase64Logo()
     };
@@ -132,11 +132,12 @@ const getExperienceLetterData = asyncHandler(async (req, res) => {
         generationDate: new Date().toLocaleDateString(),
         
         // --- ADDED THESE MISSING FIELDS ---
-        companyName: process.env.COMPANY_NAME || "Niyaz Construction and Trading",
+                companyName: process.env.COMPANY_NAME || "BIMS Hospital",
         companyAddress: process.env.COMPANY_ADDRESS || "Gandhinagar Pada, Jail Road, Balangir, Odisha, 767001",
-        companyWebsite: process.env.COMPANY_WEBSITE || "www.example.com",
-        companyEmail: process.env.COMPANY_EMAIL || "contact@example.com",
-        companyContact: process.env.COMPANY_PHONE || "123-456-7890",
+        companyWebsite: process.env.COMPANY_WEBSITE || "www.bimshospitals.com",
+        companyContact: process.env.COMPANY_PHONE || "8455005505",
+        companyEmail: process.env.COMPANY_EMAIL || "hr@bimshospitals.com",
+        companyID: process.env.COMPANY_ID || "123456789",
         base64Logo: getBase64Logo()
     };
 
@@ -186,12 +187,12 @@ const getPayrollSlipData = asyncHandler(async (req, res) => {
         generationDate: new Date().toLocaleDateString(),
 
         // Company Header Details (For the PDF Header)
-        companyName: process.env.COMPANY_NAME || "Niyaz Construction and Trading",
+            companyName: process.env.COMPANY_NAME || "BIMS Hospital",
         companyAddress: process.env.COMPANY_ADDRESS || "Gandhinagar Pada, Jail Road, Balangir, Odisha, 767001",
-        companyWebsite: process.env.COMPANY_WEBSITE || "www.niyazconstruction.com",
-        companyPhone: process.env.COMPANY_PHONE || "123-456-7890",
-        companyEmail: process.env.COMPANY_EMAIL || "contact@niyazconstruction.com",
-        companyId: process.env.COMPANY_ID || "123456789",
+        companyWebsite: process.env.COMPANY_WEBSITE || "www.bimshospitals.com",
+        companyContact: process.env.COMPANY_PHONE || "8455005505",
+        companyEmail: process.env.COMPANY_EMAIL || "hr@bimshospitals.com",
+        companyID: process.env.COMPANY_ID || "123456789",
         
         // Logo
         base64Logo: getBase64Logo()

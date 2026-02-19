@@ -1,284 +1,326 @@
-import Attendance from "../models/attendance.model.js";
-import { Leave } from "../models/leave.model.js";
-import LeaveLimit from "../models/leaveLimit.model.js";
-import { LeaveConfig } from "../models/leaveConfig.model.js";
-import { User } from "../models/user.model.js";
-import { ApiResponse } from "../utils/ApiResponse.js";
-import { asyncHandler } from "../utils/AsyncHandler.js";
-import { Employee } from "../models/employee.model.js";
-import { getCache, setCache, removeCache, removeCachePattern } from "../utils/cache.js";
-import { invalidateDashboardCache } from "./dashboard.controller.js";
+/**
+ * leave.controller.js
+ *
+ * IST contract (consistent with all other controllers):
+ * - All `date` fields stored as midnightIST("YYYY-MM-DD") = 2025-07-08T18:30:00.000Z for "2025-07-09"
+ * - month/week always derived from IST wall-clock, never from server local time or UTC toISOString()
+ * - Leave refresh logic is NOT run inside read endpoints — belongs in a cron job
+ */
+  
+import Attendance   from '../models/attendance.model.js';
+import { Leave }    from '../models/leave.model.js';
+import LeaveLimit   from '../models/leaveLimit.model.js';
+import { LeaveConfig } from '../models/leaveConfig.model.js';
+import { User }     from '../models/user.model.js';
+import { Employee } from '../models/employee.model.js';
+import { ApiResponse }  from '../utils/ApiResponse.js';
+import { asyncHandler } from '../utils/AsyncHandler.js';
+import { getCache, setCache, removeCache, removeCachePattern } from '../utils/cache.js';
+import { invalidateDashboardCache } from './dashboard.controller.js';
 
-// Cache Keys Configuration
+// ─── Cache keys ───────────────────────────────────────────────────────────────
+
 const CACHE_KEY = {
-  PREFIX: "leave_",           // Single ID: leave_12345
-  LIST_PREFIX: "leave_list_", // Query lists
-  ATTENDANCE_LIST: "attendance_list_" // To invalidate attendance when leave is approved
+  PREFIX:          'leave_',
+  LIST_PREFIX:     'leave_list_',
+  ATTENDANCE_LIST: 'attendance_list_',
 };
+
+const AUTHORIZED_APPROVER_ROLES = new Set(['Admin', 'HR Manager', 'HR Assistance', 'Head Of Department']);
+
+// ─── IST date helpers (Robust against server timezone) ────────────────────────
+
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+
+// FIX 1: Removed getTimezoneOffset() so it works perfectly regardless of whether 
+// the server is hosted in UTC, IST, or any other timezone.
+const toIST = (input = new Date()) => {
+  const date = new Date(input);
+  return new Date(date.getTime() + IST_OFFSET_MS);
+};
+
+const toISTDateString = (input) => {
+  const ist = toIST(input);
+  return [
+    ist.getUTCFullYear(),
+    String(ist.getUTCMonth() + 1).padStart(2, '0'),
+    String(ist.getUTCDate()).padStart(2, '0'),
+  ].join('-');
+};
+
+const midnightIST = (dateStr) => new Date(`${dateStr}T00:00:00+05:30`);
+
+const toISTMonthString = (input) => {
+  const ist = toIST(input);
+  return `${ist.getUTCFullYear()}-${String(ist.getUTCMonth() + 1).padStart(2, '0')}`;
+};
+
+const toISTWeekString = (input) => {
+  const ist = toIST(input);
+  const thursday = new Date(ist.getTime());
+  thursday.setUTCDate(ist.getUTCDate() - ((ist.getUTCDay() + 6) % 7) + 3);
+  const yearStart = new Date(Date.UTC(thursday.getUTCFullYear(), 0, 1));
+  const weekNo = Math.ceil(((thursday - yearStart) / 86_400_000 + 1) / 7);
+  return String(weekNo).padStart(2, '0') + String(thursday.getUTCFullYear()).slice(-2);
+};
+
+const inclusiveDayCount = (startInput, endInput) => {
+  const start = midnightIST(toISTDateString(startInput));
+  const end   = midnightIST(toISTDateString(endInput));
+  return Math.round((end - start) / 86_400_000) + 1;
+};
+
+// ─── Cache invalidation helper ────────────────────────────────────────────────
+
+const invalidateLeaveCaches = async (leaveId) => {
+  await Promise.allSettled([
+    leaveId ? removeCache(`${CACHE_KEY.PREFIX}${leaveId}`) : Promise.resolve(),
+    removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`),
+    removeCachePattern(`${CACHE_KEY.ATTENDANCE_LIST}*`),
+    invalidateDashboardCache(),
+  ]);
+};
+
+// ─── Leave limit helpers ──────────────────────────────────────────────────────
+
+const getOrInitLeaveLimit = async (employee) => {
+  let leaveLimit = await LeaveLimit.findOne({ employeeId: employee._id });
+  const leaveConfigs = await LeaveConfig.find({ posts: employee.post });
+
+  if (!leaveConfigs.length) return null;
+
+  if (!leaveLimit) {
+    const daysSinceJoining = Math.ceil((Date.now() - new Date(employee.dateOfJoining)) / 86_400_000);
+
+    leaveLimit = await LeaveLimit.create({
+      employeeId:    employee._id,
+      postId:        employee.post,
+      joinDate:      employee.dateOfJoining,
+      lastRefreshed: new Date(),
+      leaveDetails:  leaveConfigs.map((config) => ({
+        leaveType:       config._id,
+        usedLeaves:      0,
+        remainingLeaves: daysSinceJoining >= config.eligibilityDays ? config.totalLeaves : 0,
+      })),
+    });
+    return leaveLimit;
+  }
+
+  const existingIds = new Set(leaveLimit.leaveDetails.map((d) => d.leaveType.toString()));
+  const daysSinceJoining = Math.ceil((Date.now() - new Date(employee.dateOfJoining)) / 86_400_000);
+  let mutated = false;
+
+  for (const config of leaveConfigs) {
+    if (!existingIds.has(config._id.toString())) {
+      leaveLimit.leaveDetails.push({
+        leaveType:       config._id,
+        usedLeaves:      0,
+        remainingLeaves: daysSinceJoining >= config.eligibilityDays ? config.totalLeaves : 0,
+      });
+      mutated = true;
+    }
+  }
+
+  if (mutated) await leaveLimit.save();
+  return leaveLimit;
+};
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CONTROLLERS
+// ══════════════════════════════════════════════════════════════════════════════
 
 export const applyForLeave = asyncHandler(async (req, res) => {
   const { employeeId, leaveType, startDate, endDate, reason } = req.body;
 
   if (!employeeId || !leaveType || !startDate || !endDate || !reason) {
-    return res
-      .status(400)
-      .json(new ApiResponse(400, {}, "Required fields are missing", false));
+    return res.status(400).json(new ApiResponse(400, {}, 'Required fields are missing', false));
   }
 
   const leaveConfig = await LeaveConfig.findById(leaveType);
   if (!leaveConfig) {
-    return res
-      .status(404)
-      .json(new ApiResponse(404, {}, "Invalid leave type. Leave configuration not found.", false));
+    return res.status(404).json(new ApiResponse(404, {}, 'Invalid leave type. Leave configuration not found.', false));
   }
 
-  const overlappingLeaves = await Leave.find({
+  const startIST = midnightIST(toISTDateString(startDate));
+  const endIST   = midnightIST(toISTDateString(endDate));
+
+  if (endIST < startIST) {
+    return res.status(400).json(new ApiResponse(400, {}, 'endDate must be on or after startDate', false));
+  }
+
+  const overlapping = await Leave.findOne({
     employeeId,
     status: { $in: ['Pending', 'Approved'] },
-    $or: [
-      { startDate: { $lte: new Date(endDate) }, endDate: { $gte: new Date(startDate) } },
-    ],
+    startDate: { $lte: endIST },
+    endDate:   { $gte: startIST },
   });
 
-  if (overlappingLeaves.length > 0) {
-    return res
-      .status(409)
-      .json(new ApiResponse(409, {}, "There are overlapping leaves for the selected dates", false));
+  if (overlapping) {
+    return res.status(409).json(new ApiResponse(409, {}, 'There are overlapping leaves for the selected dates', false));
   }
 
-  const leaveApplication = new Leave({
+  const leaveApplication = await Leave.create({
     employeeId,
     leaveType,
-    startDate,
-    endDate,
+    startDate: startIST,
+    endDate:   endIST,
     reason,
   });
 
-  await leaveApplication.save();
+  await Promise.allSettled([
+    removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`),
+    invalidateDashboardCache(),
+  ]);
 
-  // [CACHE INVALIDATION] New leave applied -> Clear lists
-  await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
-  await invalidateDashboardCache();
-
-  return res
-    .status(201)
-    .json(new ApiResponse(201, leaveApplication, "Leave application submitted successfully", true));
+  return res.status(201).json(new ApiResponse(201, leaveApplication, 'Leave application submitted successfully', true));
 });
 
 export const approveOrDisapproveLeave = asyncHandler(async (req, res) => {
   const { id, status, comments } = req.body;
   const userId = req.auth.userId;
 
-  // Validate status
-  if (!status || !['Approved', 'Disapproved', 'Pending'].includes(status)) {
-    return res
-      .status(400)
-      .json(new ApiResponse(400, {}, "Invalid status. Must be 'Approved' or 'Disapproved'", false));
+  if (!id) {
+    return res.status(400).json(new ApiResponse(400, {}, 'Leave application ID is required', false));
   }
 
-  // Validate user authorization
+  if (!['Approved', 'Disapproved', 'Pending'].includes(status)) {
+    return res.status(400).json(new ApiResponse(400, {}, "status must be 'Approved', 'Disapproved', or 'Pending'", false));
+  }
+
   const user = await User.findOne({ userId });
-  if (!user || !(user.role === 'Admin' || user.role === 'HR Manager' ||
-    user.role === 'HR Assistance' || user.role === 'Head Of Department')) {
-    return res
-      .status(403)
-      .json(new ApiResponse(403, {}, "Unauthorized access !!", false));
+  if (!user || !AUTHORIZED_APPROVER_ROLES.has(user.role)) {
+    return res.status(403).json(new ApiResponse(403, {}, 'Unauthorized', false));
   }
 
-  // Find leave application
   const leaveApplication = await Leave.findById(id)
     .populate('leaveType')
     .populate('employeeId');
 
   if (!leaveApplication) {
-    return res
-      .status(404)
-      .json(new ApiResponse(404, {}, "Leave application not found", false));
+    return res.status(404).json(new ApiResponse(404, {}, 'Leave application not found', false));
   }
 
   const previousStatus = leaveApplication.status;
 
-  if (status === 'Approved' && previousStatus !== 'Approved') {
-    const leaveDays = Math.ceil(
-      (new Date(leaveApplication.endDate) - new Date(leaveApplication.startDate)) / (1000 * 60 * 60 * 24) + 1
-    );
+  if (previousStatus === status) {
+    return res.status(400).json(new ApiResponse(400, {}, `Leave is already ${status}`, false));
+  }
 
-    // Find or create leave limit
-    let leaveLimit = await LeaveLimit.findOne({
-      employeeId: leaveApplication.employeeId
-    });
+  // ── APPROVE ───────────────────────────────────────────────────────────────
+  if (status === 'Approved') {
+    const employee = await Employee.findById(leaveApplication.employeeId);
+    if (!employee) {
+      return res.status(404).json(new ApiResponse(404, {}, 'Employee not found', false));
+    }
 
+    const leaveLimit = await getOrInitLeaveLimit(employee);
     if (!leaveLimit) {
-      const employee = await Employee.findById(leaveApplication.employeeId);
-      if (!employee) {
-        return res
-          .status(404)
-          .json(new ApiResponse(404, {}, "Employee not found", false));
-      }
-
-      const leaveConfigs = await LeaveConfig.find({ posts: employee.post });
-      if (!leaveConfigs || leaveConfigs.length === 0) {
-        return res
-          .status(404)
-          .json(new ApiResponse(404, {}, "No leave configurations found for the employee's post", false));
-      }
-
-      // Initialize leave details based on existing configs
-      const leaveDetails = leaveConfigs.map(config => {
-        const daysSinceJoining = Math.ceil(
-          (new Date() - new Date(employee.dateOfJoining)) / (1000 * 60 * 60 * 24)
-        );
-        const isEligible = daysSinceJoining >= config.eligibilityDays;
-
-        return {
-          leaveType: config._id,
-          usedLeaves: 0,
-          remainingLeaves: isEligible ? config.totalLeaves : 0
-        };
-      });
-
-      // Create new leave limit record
-      leaveLimit = await LeaveLimit.create({
-        employeeId: employee._id,
-        postId: employee.post,
-        joinDate: employee.dateOfJoining,
-        leaveDetails,
-        lastRefreshed: new Date()
-      });
+      return res.status(404).json(new ApiResponse(404, {}, 'No leave configurations found for this employee\'s post', false));
     }
 
     const leaveDetail = leaveLimit.leaveDetails.find(
-      detail => detail.leaveType.toString() === leaveApplication.leaveType._id.toString()
+      (d) => d.leaveType.toString() === leaveApplication.leaveType._id.toString()
     );
 
     if (!leaveDetail) {
-      const employee = await Employee.findById(leaveApplication.employeeId);
-      if (!employee) {
-        return res
-          .status(404)
-          .json(new ApiResponse(404, {}, "Employee not found", false));
-      }
-
-      const leaveConfigs = await LeaveConfig.findById(leaveApplication.leaveType._id);
-      if (!leaveConfigs || leaveConfigs.length === 0) {
-        return res
-          .status(404)
-          .json(new ApiResponse(404, {}, "No leave configurations found for the employee's post", false));
-      }
-
-      const daysSinceJoining = Math.ceil(
-        (new Date() - new Date(employee.dateOfJoining)) / (1000 * 60 * 60 * 24)
-      );
-      const isEligible = daysSinceJoining >= leaveConfigs.eligibilityDays;
-
-      const leaveLimit = await LeaveLimit.findOne({ employeeId: employee._id });
-      leaveLimit?.leaveDetails?.push({
-        leaveType: leaveConfigs._id,
-        usedLeaves: 0,
-        remainingLeaves: isEligible ? leaveConfigs.totalLeaves : 0
-      })
-
-      await leaveLimit.save();
-      return res
-        .status(404)
-        .json(new ApiResponse(404, {}, "Leave type configuration not found for this employee, Please try again!", false));
+      return res.status(404).json(new ApiResponse(404, {}, 'Leave type not configured for this employee.', false));
     }
 
-    // Check leave balance
+    const leaveDays = inclusiveDayCount(leaveApplication.startDate, leaveApplication.endDate);
+
     if (leaveDays > leaveDetail.remainingLeaves) {
-      leaveApplication.status = 'Disapproved';
-      leaveApplication.comments = 'Insufficient leave balance';
+      leaveApplication.status                = 'Disapproved';
+      leaveApplication.comments              = 'Insufficient leave balance';
       leaveApplication.approvedOrDisapprovedBy = user._id;
       await leaveApplication.save();
-      return res
-        .status(409)
-        .json(new ApiResponse(409, {}, "Insufficient leave balance for the requested leave type", false));
+      return res.status(409).json(new ApiResponse(409, {}, 'Insufficient leave balance for the requested leave type', false));
     }
 
-    // Create attendance records
-    const attendanceRecords = [];
-    const currentDate = new Date(leaveApplication.startDate);
-    const endDate = new Date(leaveApplication.endDate);
+    // ── Build attendance records for each leave day ──────────────────────
+    const bulkOps = [];
+    let cursor = midnightIST(toISTDateString(leaveApplication.startDate));
+    const endIST = midnightIST(toISTDateString(leaveApplication.endDate));
+    
+    // Check Paid vs Unpaid from LeaveConfig
+    const isPaidLeave = leaveApplication.leaveType.isPaidLeave === true;
+    const leaveAttendancePercentage = isPaidLeave ? 100 : 0;
 
-    while (currentDate <= endDate) {
-      
-      // --- Week Calculation Logic (WWYY) ---
-      const d = new Date(Date.UTC(currentDate.getFullYear(), currentDate.getMonth(), currentDate.getDate()));
-      const yearShort = d.getUTCFullYear().toString().slice(-2);
-      
-      const dayNum = d.getUTCDay() || 7;
-      d.setUTCDate(d.getUTCDate() + 4 - dayNum);
-      const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
-      const weekNo = Math.ceil((((d - yearStart) / 86400000) + 1) / 7);
-      
-      const week = `${weekNo.toString().padStart(2, '0')}${yearShort}`;
-      // -------------------------------------
+    while (cursor <= endIST) {
+      const dateStr = toISTDateString(cursor);
+      const dateForDB = midnightIST(dateStr);
 
-      attendanceRecords.push({
-        employeeId: leaveApplication.employeeId,
-        date: new Date(currentDate),
-        month: new Date(currentDate).toISOString().slice(0, 7),
-        week: week,
-        isLeave: true,
-        leaveId: leaveApplication._id
+      bulkOps.push({
+        updateOne: {
+          filter: {
+            employeeId: leaveApplication.employeeId._id,
+            date:       dateForDB,
+          },
+          update: {
+            $set: {
+              employeeId:           leaveApplication.employeeId._id,
+              date:                 dateForDB,
+              month:                toISTMonthString(cursor),
+              week:                 toISTWeekString(cursor),
+              isLeave:              true,
+              leaveId:              leaveApplication._id,
+              attendancePercentage: leaveAttendancePercentage,
+              punchInTime:          null, // FIX 2: Explicitly clear punches so frontend reads N/A
+              punchOutTime:         null, 
+            },
+          },
+          upsert: true,
+        },
       });
-      currentDate.setDate(currentDate.getDate() + 1);
+
+      cursor = new Date(cursor.getTime() + 86_400_000); 
     }
 
-    if (attendanceRecords.length > 0) {
-      await Attendance.insertMany(attendanceRecords);
-      // [CACHE INVALIDATION] Attendance changed! Clear attendance lists.
-      await removeCachePattern(`${CACHE_KEY.ATTENDANCE_LIST}*`);
+    if (bulkOps.length) {
+      await Attendance.bulkWrite(bulkOps);
     }
+
+    // Deduct balance
     leaveDetail.remainingLeaves -= leaveDays;
-    leaveDetail.usedLeaves += leaveDays;
+    leaveDetail.usedLeaves      += leaveDays;
     await leaveLimit.save();
   }
 
-  // Handle moving from Approved to other status
-  else if (previousStatus === 'Approved' && status !== 'Approved') {
-    const leaveDays = Math.ceil(
-      (new Date(leaveApplication.endDate) - new Date(leaveApplication.startDate) + 1) / (1000 * 60 * 60 * 24) + 1
-    );
+  // ── UN-APPROVE (Approved → anything else) ────────────────────────────────
+  else if (previousStatus === 'Approved') {
+    const leaveDays = inclusiveDayCount(leaveApplication.startDate, leaveApplication.endDate);
 
-    const leaveLimit = await LeaveLimit.findOne({
-      employeeId: leaveApplication.employeeId
-    });
-
+    const leaveLimit = await LeaveLimit.findOne({ employeeId: leaveApplication.employeeId });
     if (leaveLimit) {
       const leaveDetail = leaveLimit.leaveDetails.find(
-        detail => detail.leaveType.toString() === leaveApplication.leaveType._id.toString()
+        (d) => d.leaveType.toString() === leaveApplication.leaveType._id.toString()
       );
-
       if (leaveDetail) {
-        leaveDetail.remainingLeaves += leaveDays;
-        leaveDetail.usedLeaves -= leaveDays;
+        leaveDetail.remainingLeaves = Math.min(
+          leaveDetail.remainingLeaves + leaveDays,
+          leaveApplication.leaveType.totalLeaves ?? Infinity
+        );
+        leaveDetail.usedLeaves = Math.max(0, leaveDetail.usedLeaves - leaveDays);
         await leaveLimit.save();
       }
     }
 
+    // Remove the attendance records generated by the approval
     await Attendance.deleteMany({
       employeeId: leaveApplication.employeeId,
-      leaveId: leaveApplication._id
+      leaveId:    leaveApplication._id,
     });
-    // [CACHE INVALIDATION] Attendance removed! Clear attendance lists.
-    await removeCachePattern(`${CACHE_KEY.ATTENDANCE_LIST}*`);
-  await invalidateDashboardCache();
-
   }
 
-  leaveApplication.status = status;
-  leaveApplication.comments = comments || leaveApplication.comments;
+  leaveApplication.status                  = status;
+  leaveApplication.comments                = comments ?? leaveApplication.comments;
   leaveApplication.approvedOrDisapprovedBy = user._id;
   await leaveApplication.save();
 
-  // [CACHE INVALIDATION]
-  await removeCache(`${CACHE_KEY.PREFIX}${id}`);
-  await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+  await invalidateLeaveCaches(id);
 
-  return res
-    .status(200)
-    .json(new ApiResponse(200, leaveApplication, `Leave application ${status.toLowerCase()} successfully`, true));
+  return res.status(200).json(
+    new ApiResponse(200, leaveApplication, `Leave application ${status.toLowerCase()} successfully`, true)
+  );
 });
 
 export const updateLeaveApplication = asyncHandler(async (req, res) => {
@@ -291,134 +333,94 @@ export const updateLeaveApplication = asyncHandler(async (req, res) => {
     .populate('employeeId');
 
   if (!leaveApplication) {
-    return res
-      .status(404)
-      .json(new ApiResponse(404, {}, "Leave application not found.", false));
+    return res.status(404).json(new ApiResponse(404, {}, 'Leave application not found.', false));
   }
 
-  const user = await User.findOne({userId})
+  const user = await User.findOne({ userId });
+  if (!user) {
+    return res.status(403).json(new ApiResponse(403, {}, 'User not found', false));
+  }
 
-  if (!user || (leaveApplication.employeeId._id.toString() !== userId && user.role=='Employee')) {
-    return res
-      .status(403)
-      .json(new ApiResponse(403, {}, "You are not authorized to update this leave application.", false));
+  const isOwner    = leaveApplication.employeeId._id.toString() === user._id.toString();
+  const isPrivileged = AUTHORIZED_APPROVER_ROLES.has(user.role);
+
+  if (!isOwner && !isPrivileged) {
+    return res.status(403).json(new ApiResponse(403, {}, 'You are not authorized to update this leave application.', false));
   }
 
   if (leaveApplication.status !== 'Pending') {
-    return res
-      .status(400)
-      .json(new ApiResponse(400, {}, "Only pending leave applications can be updated.", false));
+    return res.status(400).json(new ApiResponse(400, {}, 'Only pending leave applications can be updated.', false));
   }
 
-  if (newStartDate) leaveApplication.startDate = newStartDate;
-  if (newEndDate) leaveApplication.endDate = newEndDate;
-  if (comments) leaveApplication.comments = comments;
-  if (reason) leaveApplication.reason = reason;
+  if (newStartDate) leaveApplication.startDate = midnightIST(toISTDateString(newStartDate));
+  if (newEndDate)   leaveApplication.endDate   = midnightIST(toISTDateString(newEndDate));
+  if (comments)     leaveApplication.comments  = comments;
+  if (reason)       leaveApplication.reason    = reason;
 
-  const updatedLeaveApplication = await leaveApplication.save();
+  if (leaveApplication.endDate < leaveApplication.startDate) {
+    return res.status(400).json(new ApiResponse(400, {}, 'endDate must be on or after startDate', false));
+  }
 
-  // [CACHE INVALIDATION]
-  await removeCache(`${CACHE_KEY.PREFIX}${id}`);
-  await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
-  await invalidateDashboardCache();
+  const updated = await leaveApplication.save();
 
+  await Promise.allSettled([
+    removeCache(`${CACHE_KEY.PREFIX}${id}`),
+    removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`),
+    invalidateDashboardCache(),
+  ]);
 
-  return res
-    .status(200)
-    .json(new ApiResponse(200, updatedLeaveApplication, "Leave application updated successfully.", true));
+  return res.status(200).json(new ApiResponse(200, updated, 'Leave application updated successfully.', true));
 });
 
 export const deleteLeaveApplication = asyncHandler(async (req, res) => {
   const { id } = req.params;
 
   const leaveApplication = await Leave.findById(id);
-
   if (!leaveApplication) {
-    return res
-      .status(404)
-      .json(new ApiResponse(404, {}, "Leave application not found.", false));
+    return res.status(404).json(new ApiResponse(404, {}, 'Leave application not found.', false));
   }
 
   if (leaveApplication.status !== 'Pending') {
-    return res
-      .status(409)
-      .json(new ApiResponse(409, {}, "Cannot delete leave applications that are already processed.", false));
+    return res.status(409).json(new ApiResponse(409, {}, 'Cannot delete leave applications that are already processed.', false));
   }
 
   await Leave.findByIdAndDelete(id);
 
-  // [CACHE INVALIDATION]
-  await removeCache(`${CACHE_KEY.PREFIX}${id}`);
-  await removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`);
+  await Promise.allSettled([
+    removeCache(`${CACHE_KEY.PREFIX}${id}`),
+    removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`),
+    removeCachePattern(`${CACHE_KEY.ATTENDANCE_LIST}*`),
+  ]);
 
-  return res
-    .status(200)
-    .json(new ApiResponse(200, {}, "Leave application deleted successfully.", true));
+  return res.status(200).json(new ApiResponse(200, {}, 'Leave application deleted successfully.', true));
 });
 
 export const getLeaveApplicationById = asyncHandler(async (req, res) => {
   const { id } = req.params;
 
-  // [CACHE READ] 
   const cacheKey = `${CACHE_KEY.PREFIX}${id}`;
-  const cachedData = await getCache(cacheKey);
-  if (cachedData) {
-    return res.status(200).json(new ApiResponse(200, cachedData, "Leave application retrieved from Cache.", true));
-  }
-
-  const currentDate = new Date();
-  const employees = await LeaveLimit.find();
-
-  // Logic to refresh limits...
-  // Note: Caching means this logic runs less often, reducing DB load.
-  const updatedEmployees = [];
-
-  for (const employee of employees) {
-    const { joinDate, leaveDetails, lastRefreshed } = employee;
-
-    const yearsOfService = Math.floor((currentDate - new Date(joinDate)) / (365 * 24 * 60 * 60 * 1000));
-    const lastRefreshYear = new Date(lastRefreshed).getFullYear();
-
-    if (yearsOfService > 0 && lastRefreshYear < currentDate.getFullYear()) {
-      leaveDetails.forEach((detail) => {
-        if (detail.carryForward) {
-          detail.remainingLeaves += detail.maxLeaves - detail.usedLeaves;
-        } else {
-          detail.remainingLeaves = detail.maxLeaves;
-        }
-        detail.usedLeaves = 0;
-      });
-
-      employee.lastRefreshed = currentDate;
-      await employee.save();
-      updatedEmployees.push(employee);
-    }
+  const cached   = await getCache(cacheKey);
+  if (cached) {
+    return res.status(200).json(new ApiResponse(200, cached, 'Leave application retrieved from cache.', true));
   }
 
   const leaveApplication = await Leave.findById(id)
-    .populate('leaveType', 'leaveName maxLeaves') 
-    .populate('employeeId', 'name employeeCode') 
-    .populate('postId', 'name'); 
+    .populate('leaveType', 'leaveType totalLeaves validityDays carryForwardAllowed')
+    .populate('employeeId', 'firstName lastName employeeId');
 
   if (!leaveApplication) {
-    return res
-      .status(404)
-      .json(new ApiResponse(404, {}, "Leave application not found.", false));
+    return res.status(404).json(new ApiResponse(404, {}, 'Leave application not found.', false));
   }
 
-  // [CACHE WRITE]
   await setCache(cacheKey, leaveApplication, 3600);
-
-  return res
-    .status(200)
-    .json(new ApiResponse(200, leaveApplication, "Leave application retrieved successfully.", true));
+  return res.status(200).json(new ApiResponse(200, leaveApplication, 'Leave application retrieved successfully.', true));
 });
 
 export const getAllLeaveApplications = asyncHandler(async (req, res) => {
   const {
-    page = 1,
-    limit = 10,
-    sortBy = 'appliedOn',
+    page      = 1,
+    limit     = 10,
+    sortBy    = 'appliedOn',
     sortOrder = 'desc',
     employeeId,
     leaveType,
@@ -427,101 +429,91 @@ export const getAllLeaveApplications = asyncHandler(async (req, res) => {
     endDate,
   } = req.query;
 
-  const pageNumber = parseInt(page, 10);
-  const pageLimit = parseInt(limit, 10);
-  const sortOrderValue = sortOrder === 'desc' ? -1 : 1;
+  const pageNum  = Math.max(1, parseInt(page,  10) || 1);
+  const limitNum = Math.max(1, parseInt(limit, 10) || 10);
 
-  // [CACHE READ] Create unique key based on all filters
-  // Stringify req.query is safer for lists
-  const filterKey = JSON.stringify(req.query);
-  const cacheKey = `${CACHE_KEY.LIST_PREFIX}${filterKey}`;
-  
-  const cachedData = await getCache(cacheKey);
-  if (cachedData) {
-      return res.status(200).json(new ApiResponse(200, cachedData, "Leave applications retrieved from Cache.", true));
-  }
+  const filterKey = JSON.stringify({ employeeId, leaveType, status, startDate, endDate, sortBy, sortOrder });
+  const cacheKey  = `${CACHE_KEY.LIST_PREFIX}p${pageNum}_l${limitNum}_${filterKey}`;
 
-  const currentDate = new Date();
-  const employees = await LeaveLimit.find().populate("leaveDetails.leaveType"); 
-
-  const updatedEmployees = [];
-
-  for (const employee of employees) {
-    const { joinDate, leaveDetails, lastRefreshed } = employee;
-
-    const yearsOfService = Math.floor((currentDate - new Date(joinDate)) / ( 24 * 60 * 60 * 1000));
-    const lastRefreshYear = new Date(lastRefreshed).getFullYear();
-    
-      leaveDetails.forEach((detail) => {
-        if (detail.leaveType && detail.leaveType.validityDays && yearsOfService % detail.leaveType.validityDays==0 ) {
-        if (detail.carryForward) {
-          detail.remainingLeaves += 2*detail.leaveType.totalLeaves - detail.usedLeaves;
-        } else {
-          detail.remainingLeaves = detail.leaveType.totalLeaves;
-        }
-        detail.usedLeaves = 0;
-      }
-      });
-
-      employee.lastRefreshed = currentDate;
-      await employee.save();
-      updatedEmployees.push(employee);
-  }
-
-  if(employeeId){
-    const employeeDetails = await Employee.findById(employeeId);
-    const leaveLimitDetails = await LeaveLimit.find({employeeId});
-    const leaveConfigDetails = await LeaveConfig.find({posts:employeeDetails.post});
-
-    if(leaveConfigDetails?.length!=leaveLimitDetails[0]?.leaveDetails?.length){
-      const existingLeaveId = leaveLimitDetails[0]?.leaveDetails?.map(lld => lld.leaveType) || [];
-      
-      const leftLeaveConfig = leaveConfigDetails.filter(lcd => {
-        return !existingLeaveId.some(id => id.equals(lcd._id));
-      });
-      
-      const leaveDetails = leftLeaveConfig?.map((config) => (leaveLimitDetails[0]?.leaveDetails?.push({
-        leaveType: config._id, 
-        maxLeaves: config.totalLeaves,
-        usedLeaves: 0,
-        remainingLeaves: config.totalLeaves, 
-        eligibilityDays: config.eligibilityDays || 0,
-        carryForward: config.carryForward,
-        encashable: config.encashable,
-      })));
-
-      await leaveLimitDetails[0]?.save();
-    }
+  const cached = await getCache(cacheKey);
+  if (cached) {
+    return res.status(200).json(new ApiResponse(200, cached, 'Leave applications retrieved from cache.', true));
   }
 
   const filterConditions = {};
-
-  // Add optional filters
   if (employeeId) filterConditions.employeeId = employeeId;
-  if (leaveType) filterConditions.leaveType = leaveType;
-  if (status) filterConditions.status = status;
+  if (leaveType)  filterConditions.leaveType  = leaveType;
+  if (status)     filterConditions.status     = status;
 
-  const leaveApplications = await Leave.find(filterConditions)
-    .populate('leaveType', 'leaveType') 
-    .populate('employeeId', 'firstName lastName employeeId') 
-    .skip((pageNumber - 1) * pageLimit) 
-    .limit(pageLimit) 
-    .sort({ [sortBy]: sortOrderValue }); 
+  if (startDate || endDate) {
+    filterConditions.startDate = {};
+    if (startDate) filterConditions.startDate.$gte = midnightIST(toISTDateString(startDate));
+    if (endDate) {
+      const endIST = new Date(midnightIST(toISTDateString(endDate)).getTime() + 86_400_000 - 1);
+      filterConditions.startDate.$lte = endIST;
+    }
+  }
 
-  const totalLeaveApplications = await Leave.countDocuments(filterConditions);
-  const totalPages = Math.ceil(totalLeaveApplications / pageLimit);
+  const [leaveApplications, total] = await Promise.all([
+    Leave.find(filterConditions)
+      .populate('leaveType', 'leaveType totalLeaves')
+      .populate('employeeId', 'firstName lastName employeeId')
+      .sort({ [sortBy]: sortOrder === 'desc' ? -1 : 1 })
+      .skip((pageNum - 1) * limitNum)
+      .limit(limitNum),
+    Leave.countDocuments(filterConditions),
+  ]);
 
-  const responsePayload = {
-      leaveApplications,
-        totalPages,
-        currentPage: pageNumber,
-        totalLeaveApplications,
+  const payload = {
+    leaveApplications,
+    totalPages:           Math.ceil(total / limitNum),
+    currentPage:          pageNum,
+    totalLeaveApplications: total,
   };
 
-  // [CACHE WRITE]
-  await setCache(cacheKey, responsePayload, 3600);
+  await setCache(cacheKey, payload, 3600);
 
-  return res.status(200).json(
-    new ApiResponse(200, responsePayload, 'Leave applications retrieved successfully.', true)
-  );
+  return res.status(200).json(new ApiResponse(200, payload, 'Leave applications retrieved successfully.', true));
 });
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CRON JOB — Leave balance refresh
+// ══════════════════════════════════════════════════════════════════════════════
+
+export const refreshLeaveLimits = async () => {
+  console.log('[LeaveRefresh] Starting leave limit refresh...');
+  const now = new Date();
+
+  const allLimits = await LeaveLimit.find().populate('leaveDetails.leaveType');
+  let refreshed = 0;
+
+  for (const limit of allLimits) {
+    const daysSinceJoining = Math.ceil((now - new Date(limit.joinDate)) / 86_400_000);
+    let mutated = false;
+
+    for (const detail of limit.leaveDetails) {
+      const config = detail.leaveType; 
+      if (!config?.validityDays || config.validityDays <= 0) continue;
+
+      if (daysSinceJoining > 0 && daysSinceJoining % config.validityDays === 0) {
+        if (config.carryForwardAllowed) {
+          const carryLimit = config.carryForwardLimit ?? 0;
+          const unused     = Math.min(detail.remainingLeaves, carryLimit);
+          detail.remainingLeaves = config.totalLeaves + unused;
+        } else {
+          detail.remainingLeaves = config.totalLeaves;
+        }
+        detail.usedLeaves = 0;
+        mutated = true;
+      }
+    }
+
+    if (mutated) {
+      limit.lastRefreshed = now;
+      await limit.save();
+      refreshed++;
+    }
+  }
+
+  console.log(`[LeaveRefresh] Done. Refreshed ${refreshed} of ${allLimits.length} records.`);
+};

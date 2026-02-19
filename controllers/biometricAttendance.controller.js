@@ -1,665 +1,365 @@
+/**
+ * attendanceReconciliation.js
+ * Production-grade biometric attendance sync.
+ * Strictly uses native Intl IST date calculations to perfectly match `attendance.controller.js`.
+ */
+
 import axios from 'axios';
 import Attendance from '../models/attendance.model.js';
 import { Employee } from '../models/employee.model.js';
 import { ShiftRoster } from '../models/shiftRoster.model.js';
 import { asyncHandler } from '../utils/AsyncHandler.js';
 import { ApiResponse } from '../utils/ApiResponse.js';
+import { removeCachePattern } from '../utils/cache.js';
+import { invalidateDashboardCache } from './dashboard.controller.js';
 
-const BIOMETRIC_API_URL = 'https://klcloud.in/bims/api/v2/WebAPI/GetDeviceLogs';
-const API_KEY = '275412062524';
+// ─── Config ─────────────────────────────────────────────────────────────────
 
-// Helper function to get IST date objects
-const getISTDate = (date = new Date()) => {
-  const istOffset = 5.5 * 60 * 60 * 1000; // IST is UTC+5:30
-  const utcTime = date.getTime() + (date.getTimezoneOffset() * 60000);
-  return new Date(utcTime + istOffset);
+const CONFIG = {
+  BIOMETRIC_API_URL: 'https://klcloud.in/bims/api/v2/WebAPI/GetDeviceLogs',
+  API_KEY: '275412062524',
+  SESSION_MAX_HOURS: 16,        // Maximum length of a valid shift (for overnight detection)
+  PUNCH_IGNORE_MINUTES: 10,     // Ignore duplicate machine punches within 10 mins
+  NEW_SHIFT_HOURS: 4,           // If a punch occurs 4+ hours after an OUT punch, it's a new shift
 };
 
-// Helper function to convert biometric log date to proper IST Date object
-const convertLogDateToIST = (logDate) => {
-  try {
-    // Input format: "2025-07-11 09:49:32"
-    // Assuming this is already in IST
-    const isoString = logDate.replace(' ', 'T');
-    const date = new Date(isoString);
+const CACHE_KEY = {
+  LIST_PREFIX: 'attendance_list_',
+};
+
+// ─── Bulletproof IST Date Helpers (Immune to Server Timezone) ────────────────
+
+const toISTDateString = (input) => {
+  // Uses en-CA locale which natively outputs YYYY-MM-DD format
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Kolkata',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).format(new Date(input));
+};
+
+const toISTMonthString = (input) => {
+  const dStr = toISTDateString(input);
+  return dStr.substring(0, 7); // Returns YYYY-MM
+};
+
+const midnightIST = (dateStr) => new Date(`${dateStr}T00:00:00+05:30`);
+
+const getWeekId = (input) => {
+  const dStr = toISTDateString(input);
+  const noon = new Date(`${dStr}T12:00:00Z`); // use noon UTC to safely calculate week
+  const thursday = new Date(noon);
+  thursday.setUTCDate(noon.getUTCDate() - ((noon.getUTCDay() + 6) % 7) + 3);
+  const yearStart = new Date(Date.UTC(thursday.getUTCFullYear(), 0, 1));
+  const weekNo = Math.ceil(((thursday - yearStart) / 86_400_000 + 1) / 7);
+  const yy = String(thursday.getUTCFullYear()).slice(-2);
+  return String(weekNo).padStart(2, '0') + yy;
+};
+
+// ─── Percentage Calculation Helpers (100% Synced with Controller) ────────────
+
+const convertTo24Hour = (timeStr) => {
+  if (!timeStr) return "00:00:00";
+  const cleanStr = timeStr.trim();
+  if (!cleanStr.toLowerCase().includes('m')) {
+    return cleanStr.length === 5 ? `${cleanStr}:00` : cleanStr;
+  }
+  const [time, modifier] = cleanStr.split(' ');
+  let [hours, minutes] = time.split(':');
+  hours = parseInt(hours, 10);
+  if (modifier.toUpperCase() === 'PM' && hours < 12) hours += 12;
+  if (modifier.toUpperCase() === 'AM' && hours === 12) hours = 0;
+  return `${String(hours).padStart(2, '0')}:${minutes}:00`;
+};
+
+const calculateAttendancePercentage = (post, sessionDate, punchInTime, punchOutTime, scheduledShift) => {
+  if (!punchInTime || !punchOutTime) return 0;
+
+  let scheduledMinutes = 0;
+
+  if (scheduledShift?.shiftId?.startTime && scheduledShift?.shiftId?.endTime) {
+    const dateStr    = toISTDateString(sessionDate);
+    const tStart     = convertTo24Hour(scheduledShift.shiftId.startTime);
+    const tEnd       = convertTo24Hour(scheduledShift.shiftId.endTime);
     
-    // If the biometric system gives IST time, we need to adjust for storage
-    // Create a date object that represents the IST time
-    const istDate = new Date(isoString + '+05:30');
-    return istDate;
-  } catch (error) {
-    console.error('Error converting log date to IST:', error);
+    const shiftStart = new Date(`${dateStr}T${tStart}+05:30`);
+    const shiftEnd   = new Date(`${dateStr}T${tEnd}+05:30`);
+    const raw        = (shiftEnd - shiftStart) / 60_000;
+
+    // Handle overnight shift definitions
+    scheduledMinutes = raw < 0 ? raw + 24 * 60 : raw;
+  } else if (post?.workingHour > 0) {
+    scheduledMinutes = post.workingHour * 60;
+  }
+
+  if (scheduledMinutes <= 0) return 0;
+
+  const workedMinutes = Math.round((new Date(punchOutTime) - new Date(punchInTime)) / 60_000);
+  if (workedMinutes <= 0) return 0;
+
+  if (workedMinutes >= scheduledMinutes) {
+    return Math.max(100, Math.round((workedMinutes / scheduledMinutes) * 100));
+  }
+
+  const shortfall   = scheduledMinutes - workedMinutes;
+  const thresholds  = Array.isArray(post?.lateAttendanceMetrics) ? post.lateAttendanceMetrics : [];
+
+  if (!thresholds.length) {
+    return Math.max(0, Math.round((workedMinutes / scheduledMinutes) * 100));
+  }
+
+  const sorted     = [...thresholds].sort((a, b) => b.allowedMinutes - a.allowedMinutes);
+  const applicable = sorted.find((m) => shortfall > m.allowedMinutes);
+
+  if (!applicable) return 100;
+
+  return Math.max(0, Math.round(100 - applicable.attendanceDeductionPercent));
+};
+
+// ─── Data Ingestion Helpers ──────────────────────────────────────────────────
+
+/** Parses biometric API date "2025-07-08 19:17:03" natively as IST to UTC */
+const parseBiometricLogToIST = (logDate) => {
+  try {
+    return new Date(logDate.replace(' ', 'T') + '+05:30');
+  } catch {
     return null;
   }
 };
 
-// Helper function to get date in YYYY-MM-DD format using IST
-const getDateStringIST = (date) => {
-  const istDate = getISTDate(date);
-  return istDate.toISOString().split('T')[0];
+/**
+ * Dynamic Shift Fetcher
+ * Prevents the "0% bug" by ensuring shifts are matched strictly by IST date strings.
+ */
+const getShift = async (employeeId, dateStr, shiftCache) => {
+  const key = `${employeeId.toString()}|${dateStr}`;
+  if (shiftCache.has(key)) return shiftCache.get(key);
+
+  const shift = await ShiftRoster.findOne({
+    employeeId: employeeId,
+    date: midnightIST(dateStr)
+  }).populate('shiftId');
+
+  shiftCache.set(key, shift);
+  return shift;
 };
 
-// Helper function to create IST date from YYYY-MM-DD string
-const createISTDateFromString = (dateString) => {
-  // Create date at midnight IST
-  const istDate = new Date(dateString + 'T00:00:00+05:30');
-  return istDate;
-};
+/**
+ * State machine to process a single punch timestamp.
+ * Handles debouncing, open sessions, back-to-back shifts, and overnight shifts seamlessly.
+ */
+const processEmployeePunch = async (employee, ts, shiftCache) => {
+  const cutoff = new Date(ts.getTime() - CONFIG.SESSION_MAX_HOURS * 3_600_000);
 
-// Helper function to check if a date is the same day in IST
-const isSameDayIST = (date1, date2) => {
-  const d1 = getISTDate(date1);
-  const d2 = getISTDate(date2);
-  return d1.toDateString() === d2.toDateString();
-};
+  // 1. Find an open session for this employee (within the last 16 hours)
+  let session = await Attendance.findOne({
+    employeeId: employee._id,
+    punchInTime: { $gte: cutoff, $lte: ts }
+  }).sort({ punchInTime: -1 });
 
-// Helper function to calculate attendance percentage
-const calculateAttendancePercentage = async (post, date, punchInTime, punchOutTime, scheduledShift) => {
-  if (!punchOutTime) {
-    return 0;
-  }
-
-  const shiftStartTime = scheduledShift.shiftId.startTime;
-  const shiftEndTime = scheduledShift.shiftId.endTime;
-
-  // Use IST date for shift calculations
-  const istDate = getISTDate(date);
-  const dateString = istDate.toDateString();
-  
-  const dateShiftStartTimeString = `${dateString} ${shiftStartTime}`;
-  const dateShiftEndTimeString = `${dateString} ${shiftEndTime}`;
-
-  const scheduledMinutes = Math.floor((new Date(dateShiftEndTimeString) - new Date(dateShiftStartTimeString)) / 60000);
-  const workedMinutes = Math.floor((new Date(punchOutTime) - new Date(punchInTime)) / 60000);
-
-  let timeDifference = workedMinutes - Math.abs(scheduledMinutes);
-  if (!scheduledMinutes) {
-    timeDifference = 0;
-  }
-
-  const thresholds = post.lateAttendanceMetrics;
-  let attendancePercentage = 100;
-
-  if (thresholds && timeDifference !== 0) {
-    const sortedMetrics = thresholds.sort((a, b) => b.allowedMinutes - a.allowedMinutes);
-    const applicableLateMetric = sortedMetrics.find(metric => Math.abs(timeDifference) > metric.allowedMinutes);
-
-    if (applicableLateMetric) {
-      if (timeDifference < 0) {
-        attendancePercentage -= applicableLateMetric.attendanceDeductionPercent;
-      } else if (timeDifference > 0) {
-        attendancePercentage += applicableLateMetric.attendanceDeductionPercent;
+  // Safety net: If session has a punchOutTime that was hours ago, it's a new shift, not an update.
+  if (session && session.punchOutTime) {
+      const hoursSinceOut = (ts - session.punchOutTime) / 3_600_000;
+      if (hoursSinceOut > CONFIG.NEW_SHIFT_HOURS) {
+          session = null; // Forces creation of a new Punch IN
       }
-    }
   }
 
-  return Math.max(0, Math.min(100, attendancePercentage));
-};
-
-// Helper function to check if employee has incomplete attendance from previous day
-const checkPreviousDayIncompleteAttendance = async (employeeId, targetDate) => {
-  try {
-    const previousDay = new Date(targetDate);
-    previousDay.setDate(previousDay.getDate() - 1);
+  // 2. If a valid session exists, treat this log as a punch OUT
+  if (session && (!session.punchOutTime || ts > session.punchOutTime)) {
+    const minsSinceIn = (ts - session.punchInTime) / 60_000;
     
-    // Find the last attendance record for the employee on the previous day
-    const lastAttendance = await Attendance.findOne({
-      employeeId: employeeId,
-      date: previousDay,
-      punchInTime: { $exists: true, $ne: null },
-      punchOutTime: { $exists: false } // Missing punch out time
-    }).sort({ punchInTime: -1 }); // Get the latest punch in without punch out
+    // Anti-bounce: Ignore duplicate machine punches within 10 minutes
+    if (minsSinceIn < CONFIG.PUNCH_IGNORE_MINUTES && !session.punchOutTime) {
+      return { action: 'ignored_bounce', session };
+    }
 
-    return lastAttendance;
-  } catch (error) {
-    console.error('Error checking previous day attendance:', error);
-    return null;
-  }
-};
+    session.punchOutTime = ts;
+    const dateStr = toISTDateString(session.date);
+    const shift = await getShift(employee._id, dateStr, shiftCache);
 
-// Improved function to process punch logs for an employee
-const processPunchLogs = async (logs, targetDate, employeeId) => {
-  if (!logs || logs.length === 0) {
-    return [];
-  }
-
-  // Convert log dates to proper IST format and sort logs by timestamp
-  const sortedLogs = logs
-    .map(log => ({
-      ...log,
-      convertedDate: convertLogDateToIST(log.LogDate)
-    }))
-    .filter(log => log.convertedDate !== null) // Filter out invalid dates
-    .sort((a, b) => a.convertedDate - b.convertedDate);
-  
-  // Check if employee has incomplete attendance from previous day
-  const incompleteAttendance = await checkPreviousDayIncompleteAttendance(employeeId, targetDate);
-  
-  let startIndex = 0;
-  let punchPairs = [];
-
-  // If there's incomplete attendance from previous day, use first log as punch out
-  if (incompleteAttendance && sortedLogs.length > 0) {
-    const firstLog = sortedLogs[0];
-    const firstLogDate = getDateStringIST(firstLog.convertedDate);
-    const targetDateString = getDateStringIST(new Date(targetDate));
+    if (!session.isLeave) {
+      session.attendancePercentage = calculateAttendancePercentage(
+        employee.post, session.date, session.punchInTime, session.punchOutTime, shift
+      );
+    }
     
-    // If first log is from target date, use it as punch out for previous day
-    if (firstLogDate === targetDateString) {
-      // Update the incomplete attendance record with punch out time
-      await Attendance.findByIdAndUpdate(incompleteAttendance._id, {
-        punchOutTime: firstLog.convertedDate
-      });
-      
-      // Recalculate attendance percentage for the updated record
-      const employee = await Employee.findById(employeeId).populate("post");
-      const previousDayShift = await ShiftRoster.findOne({
-        employeeId: employeeId,
-        date: incompleteAttendance.date
-      }).populate("shiftId");
-      
-      if (employee && previousDayShift) {
-        const updatedPercentage = await calculateAttendancePercentage(
-          employee.post,
-          incompleteAttendance.date,
-          incompleteAttendance.punchInTime,
-          firstLog.convertedDate,
-          previousDayShift
-        );
-        
-        await Attendance.findByIdAndUpdate(incompleteAttendance._id, {
-          attendancePercentage: updatedPercentage
-        });
-      }
-      
-      startIndex = 1; // Skip first log as it's used for previous day punch out
-    }
-  }
+    await session.save();
+    return { action: 'updated_out', session };
+  } 
+  
+  // 3. If no session exists, treat this log as a punch IN
+  const dateStr = toISTDateString(ts);
+  const dateForDB = midnightIST(dateStr);
 
-  // Process remaining logs in pairs (punch in, punch out)
-  for (let i = startIndex; i < sortedLogs.length; i += 2) {
-    const punchInTime = sortedLogs[i].convertedDate;
-    let punchOutTime = null;
-
-    // Check if we have a pair
-    if (i + 1 < sortedLogs.length) {
-      punchOutTime = sortedLogs[i + 1].convertedDate;
-    }
-
-    punchPairs.push({
-      punchInTime,
-      punchOutTime,
-      date: targetDate
+  let existingDayRecord = await Attendance.findOne({ employeeId: employee._id, date: dateForDB });
+  
+  if (!existingDayRecord) {
+    // Create entirely new day session
+    const newSession = new Attendance({
+      employeeId: employee._id,
+      date: dateForDB,
+      isLeave: false,
+      month: toISTMonthString(ts),
+      week: getWeekId(ts),
+      attendancePercentage: 0,
+      punchInTime: ts
     });
+    await newSession.save();
+    return { action: 'created_in', session: newSession };
+  } else {
+    // A record exists for today (e.g. they were marked on Leave, or HR manually made a record)
+    if (existingDayRecord.isLeave) {
+      return { action: 'ignored_leave', session: existingDayRecord };
+    }
+    
+    // Inject the punch times if they are missing
+    if (!existingDayRecord.punchInTime || ts < existingDayRecord.punchInTime) {
+      existingDayRecord.punchInTime = ts;
+      await existingDayRecord.save();
+      return { action: 'updated_in', session: existingDayRecord };
+    } else if (!existingDayRecord.punchOutTime || ts > existingDayRecord.punchOutTime) {
+      existingDayRecord.punchOutTime = ts;
+      const shift = await getShift(employee._id, dateStr, shiftCache);
+      existingDayRecord.attendancePercentage = calculateAttendancePercentage(
+        employee.post, existingDayRecord.date, existingDayRecord.punchInTime, existingDayRecord.punchOutTime, shift
+      );
+      await existingDayRecord.save();
+      return { action: 'updated_out', session: existingDayRecord };
+    }
   }
 
-  return punchPairs;
+  return { action: 'ignored', session: existingDayRecord };
 };
 
-// Function to group logs by employee
-const groupLogsByEmployee = (logs) => {
-  const groupedLogs = {};
-  
-  logs.forEach(log => {
-    const employeeCode = log.EmployeeCode;
-    if (!groupedLogs[employeeCode]) {
-      groupedLogs[employeeCode] = [];
-    }
-    groupedLogs[employeeCode].push(log);
+// ─── API Controllers ─────────────────────────────────────────────────────────
+
+export const processBiometricAttendance = asyncHandler(async (req, res) => {
+  const { fromDate, toDate } = req.query;
+
+  if (!fromDate || !toDate) {
+    return res.status(400).json(new ApiResponse(400, null, "FromDate and ToDate are required (YYYY-MM-DD)", false));
+  }
+
+  // Extend fetching by 1 day to ensure we catch next-day punch-outs for overnight shifts
+  const endDate = new Date(midnightIST(toDate).getTime() + 86_400_000);
+  const toDateExtended = toISTDateString(endDate);
+
+  const response = await axios.get(CONFIG.BIOMETRIC_API_URL, {
+    params: { APIKey: CONFIG.API_KEY, FromDate: fromDate, ToDate: toDateExtended }
   });
-  
-  return groupedLogs;
-};
 
-// Function to handle odd number of punches by fetching next day's first log
-const handleOddPunches = async (employeeCode, targetDate, punchPairs) => {
-  if (punchPairs.length === 0) return punchPairs;
+  const rawLogs = response.data || [];
+  if (!rawLogs.length) {
+    return res.status(200).json(new ApiResponse(200, { processed: 0 }, "No biometric logs found for date range", true));
+  }
 
-  const lastPair = punchPairs[punchPairs.length - 1];
-  
-  // If last pair has punch in but no punch out, try to get next day's first log
-  if (lastPair.punchInTime && !lastPair.punchOutTime) {
-    const nextDay = new Date(targetDate);
-    nextDay.setDate(nextDay.getDate() + 1);
-    const nextDayString = getDateStringIST(nextDay);
+  // 1. Group, Parse, and Sort Logs
+  const map = new Map();
+  for (const log of rawLogs) {
+    const ts = parseBiometricLogToIST(log.LogDate);
+    if (!ts || isNaN(ts.getTime())) continue;
+    const code = log.EmployeeCode?.trim();
+    if (!code) continue;
     
+    if (!map.has(code)) map.set(code, []);
+    map.get(code).push(ts);
+  }
+
+  const employeeCodes = Array.from(map.keys());
+  const employees = await Employee.find({ employeeId: { $in: employeeCodes } }).populate('post');
+  
+  // 2. Initialize dynamic shift cache
+  const shiftCache = new Map();
+
+  // 3. Process logs chronologically per employee
+  const stats = { created: 0, updated: 0, ignored: 0, failed: 0, errors: [] };
+
+  for (const employee of employees) {
     try {
-      // Fetch next day's logs to find punch out
-      const response = await axios.get(BIOMETRIC_API_URL, {
-        params: {
-          APIKey: API_KEY,
-          FromDate: nextDayString,
-          ToDate: nextDayString
-        }
-      });
-      
-      const nextDayLogs = response.data || [];
-      const employeeNextDayLogs = nextDayLogs.filter(log => log.EmployeeCode === employeeCode);
-      
-      if (employeeNextDayLogs.length > 0) {
-        // Convert dates and sort, then take first log as punch out
-        const sortedNextDayLogs = employeeNextDayLogs
-          .map(log => ({
-            ...log,
-            convertedDate: convertLogDateToIST(log.LogDate)
-          }))
-          .filter(log => log.convertedDate !== null)
-          .sort((a, b) => a.convertedDate - b.convertedDate);
-        
-        if (sortedNextDayLogs.length > 0) {
-          lastPair.punchOutTime = sortedNextDayLogs[0].convertedDate;
-        }
+      const timestamps = map.get(employee.employeeId.toString());
+      timestamps.sort((a, b) => a - b); // Crucial: ensures IN -> OUT processing order
+
+      for (const ts of timestamps) {
+        const result = await processEmployeePunch(employee, ts, shiftCache);
+        if (result.action === 'created_in' || result.action === 'updated_in') stats.created++;
+        else if (result.action === 'updated_out') stats.updated++;
+        else stats.ignored++;
       }
     } catch (error) {
-      console.error(`Error fetching next day logs for employee ${employeeCode}:`, error);
+      stats.failed++;
+      stats.errors.push(`[${employee.employeeId}] ${error.message}`);
     }
   }
-  
-  return punchPairs;
-};
 
-// Function to reconcile attendance for a specific date
-const reconcileAttendanceForDate = async (date) => {
-  try {
-    console.log(`Starting attendance reconciliation for date: ${date} (IST)`);
-    
-    // Create proper IST date for the target date
-    const targetDate = createISTDateFromString(date);
-    
-    // Delete all existing attendance records for the date
-    await Attendance.deleteMany({ 
-      date: targetDate 
-    });
-    console.log(`Deleted existing attendance records for ${date}`);
-    
-    // Fetch logs for target date and next day (to handle punch out scenarios)
-    const nextDay = new Date(targetDate);
-    nextDay.setDate(nextDay.getDate() + 1);
-    const nextDayString = getDateStringIST(nextDay);
-    
-    console.log(`Fetching logs from ${date} to ${nextDayString}`);
-    
-    const response = await axios.get(BIOMETRIC_API_URL, {
-      params: {
-        APIKey: API_KEY,
-        FromDate: date,
-        ToDate: nextDayString
-      }
-    });
-    
-    const logs = response.data || [];
-    console.log(`Fetched ${logs.length} biometric logs`);
-    
-    if (logs.length === 0) {
-      console.log(`No biometric logs found for date range`);
-      return {
-        success: true,
-        message: `No biometric logs found for date range`,
-        processedCount: 0
-      };
-    }
+  // Invalidate Dashboard caches immediately
+  await Promise.allSettled([
+    removeCachePattern(`${CACHE_KEY.LIST_PREFIX}*`),
+    invalidateDashboardCache(),
+  ]);
 
-    // Group logs by employee
-    const groupedLogs = groupLogsByEmployee(logs);
-    
-    const results = {
-      created: 0,
-      updated: 0,
-      failed: 0,
-      errors: []
-    };
-
-    // Process each employee's logs
-    for (const [employeeCode, employeeLogs] of Object.entries(groupedLogs)) {
-      try {
-        // Find employee by employeeId
-        const employee = await Employee.findOne({ 
-          employeeId: employeeCode 
-        }).populate("post");
-
-        if (!employee) {
-          results.failed++;
-          results.errors.push(`Employee with code ${employeeCode} not found`);
-          continue;
-        }
-
-        // Get scheduled shift for the target date
-        const scheduledShift = await ShiftRoster.findOne({
-          employeeId: employee._id,
-          date: targetDate
-        }).populate("shiftId");
-
-        // Filter logs for target date only using IST comparison
-        const targetDateLogs = employeeLogs.filter(log => {
-          const convertedDate = convertLogDateToIST(log.LogDate);
-          if (!convertedDate) return false;
-          return isSameDayIST(convertedDate, targetDate);
-        });
-
-        // Process punch logs for this employee
-        let punchPairs = await processPunchLogs(targetDateLogs, targetDate, employee._id);
-        
-        // Handle odd number of punches
-        punchPairs = await handleOddPunches(employeeCode, targetDate, punchPairs);
-
-        // Create attendance records for each punch pair
-        for (const pair of punchPairs) {
-          let attendancePercentage = 100;
-          
-          if (scheduledShift && pair.punchInTime && pair.punchOutTime) {
-            attendancePercentage = await calculateAttendancePercentage(
-              employee.post,
-              targetDate,
-              pair.punchInTime,
-              pair.punchOutTime,
-              scheduledShift
-            );
-          } else if (!pair.punchOutTime) {
-            attendancePercentage = 0;
-          }
-
-          // Calculate month using IST
-          const istDate = getISTDate(targetDate);
-          const monthYear = istDate.getFullYear();
-          const monthMonth = String(istDate.getMonth() + 1).padStart(2, '0');
-          const month = `${monthYear}-${monthMonth}`;
-
-          // Create attendance record
-          const attendanceData = {
-            employeeId: employee._id,
-            date: targetDate,
-            punchInTime: pair.punchInTime,
-            punchOutTime: pair.punchOutTime,
-            isLeave: false,
-            month,
-            attendancePercentage
-          };
-
-          const attendance = new Attendance(attendanceData);
-          await attendance.save();
-          results.created++;
-        }
-
-        // If no punch pairs found, create a record with 0% attendance
-        if (punchPairs.length === 0 && scheduledShift) {
-          const istDate = getISTDate(targetDate);
-          const monthYear = istDate.getFullYear();
-          const monthMonth = String(istDate.getMonth() + 1).padStart(2, '0');
-          const month = `${monthYear}-${monthMonth}`;
-
-          const attendanceData = {
-            employeeId: employee._id,
-            date: targetDate,
-            punchInTime: null,
-            punchOutTime: null,
-            isLeave: false,
-            month,
-            attendancePercentage: 0
-          };
-
-          const attendance = new Attendance(attendanceData);
-          await attendance.save();
-          results.created++;
-        }
-
-      } catch (error) {
-        results.failed++;
-        results.errors.push(`Error processing employee ${employeeCode}: ${error.message}`);
-      }
-    }
-
-    console.log(`Reconciliation completed for ${date}:`, results);
-    return {
-      success: true,
-      date,
-      ...results
-    };
-
-  } catch (error) {
-    console.error(`Error in attendance reconciliation for ${date}:`, error);
-    return {
-      success: false,
-      date,
-      error: error.message
-    };
-  }
-};
-
-// Fetch biometric logs from API
-const fetchBiometricLogs = asyncHandler(async (req, res) => {
-  try {
-    const { fromDate, toDate } = req.query;
-    
-    if (!fromDate || !toDate) {
-      return res.status(400).json(
-        new ApiResponse(400, null, "FromDate and ToDate are required", false)
-      );
-    }
-
-    const response = await axios.get(BIOMETRIC_API_URL, {
-      params: {
-        APIKey: API_KEY,
-        FromDate: fromDate,
-        ToDate: toDate
-      }
-    });
-
-    const logs = response.data || [];
-    const groupedLogs = groupLogsByEmployee(logs);
-
-    // Convert grouped logs to processed format for display
-    const processedLogs = [];
-    for (const [employeeCode, employeeLogs] of Object.entries(groupedLogs)) {
-      const employee = await Employee.findOne({ employeeId: employeeCode });
-      
-      if (employee) {
-        const fromDateIST = createISTDateFromString(fromDate);
-        const toDateIST = createISTDateFromString(toDate);
-        
-        const targetDateLogs = employeeLogs.filter(log => {
-          const convertedDate = convertLogDateToIST(log.LogDate);
-          if (!convertedDate) return false;
-          return convertedDate >= fromDateIST && convertedDate <= toDateIST;
-        });
-        
-        const punchPairs = await processPunchLogs(targetDateLogs, fromDateIST, employee._id);
-        
-        processedLogs.push({
-          employeeCode,
-          employeeName: `${employee.firstName} ${employee.lastName}`,
-          totalLogs: targetDateLogs.length,
-          punchPairs,
-          logs: targetDateLogs.map(log => ({
-            ...log,
-            convertedDate: convertLogDateToIST(log.LogDate)
-          }))
-        });
-      }
-    }
-
-    return res.status(200).json(
-      new ApiResponse(200, { 
-        rawLogs: logs, 
-        processedLogs,
-        totalRawLogs: logs.length,
-        totalProcessedRecords: processedLogs.length
-      }, "Biometric logs fetched successfully", true)
-    );
-
-  } catch (error) {
-    console.error("Error fetching biometric logs:", error);
-    return res.status(500).json(
-      new ApiResponse(500, null, "Error fetching biometric logs", false)
-    );
-  }
+  return res.status(200).json(
+    new ApiResponse(200, { stats, dateRange: { fromDate, toDate } }, "Biometric attendance processing completed", true)
+  );
 });
 
-// Process and save biometric attendance data
-const processBiometricAttendance = asyncHandler(async (req, res) => {
-  try {
-    const { fromDate, toDate } = req.query;
-    
-    if (!fromDate || !toDate) {
-      return res.status(400).json(
-        new ApiResponse(400, null, "FromDate and ToDate are required", false)
-      );
-    }
+export const fetchBiometricLogs = asyncHandler(async (req, res) => {
+  const { fromDate, toDate } = req.query;
 
-    const results = [];
-    const startDate = createISTDateFromString(fromDate);
-    const endDate = createISTDateFromString(toDate);
-    
-    // Process each date in the range
-    for (let date = startDate; date <= endDate; date.setDate(date.getDate() + 1)) {
-      const dateString = getDateStringIST(date);
-      const result = await reconcileAttendanceForDate(dateString);
-      results.push(result);
-      
-      // Add a small delay to avoid overwhelming the API
-      await new Promise(resolve => setTimeout(resolve, 1000));
-    }
-
-    // Calculate summary statistics
-    const summary = {
-      totalDates: results.length,
-      successfulDates: results.filter(r => r.success).length,
-      failedDates: results.filter(r => !r.success).length,
-      totalCreated: results.reduce((sum, r) => sum + (r.created || 0), 0),
-      totalUpdated: results.reduce((sum, r) => sum + (r.updated || 0), 0),
-      totalFailed: results.reduce((sum, r) => sum + (r.failed || 0), 0),
-      totalErrors: results.reduce((sum, r) => sum + (r.errors ? r.errors.length : 0), 0)
-    };
-
-    return res.status(200).json(
-      new ApiResponse(200, {
-        results,
-        summary,
-        dateRange: { fromDate, toDate }
-      }, "Biometric attendance processing completed", true)
-    );
-
-  } catch (error) {
-    console.error("Error processing biometric attendance:", error);
-    return res.status(500).json(
-      new ApiResponse(500, null, "Error processing biometric attendance", false)
-    );
+  if (!fromDate || !toDate) {
+    return res.status(400).json(new ApiResponse(400, null, "FromDate and ToDate are required", false));
   }
+
+  const response = await axios.get(CONFIG.BIOMETRIC_API_URL, {
+    params: { APIKey: CONFIG.API_KEY, FromDate: fromDate, ToDate: toDate }
+  });
+
+  const logs = response.data || [];
+  return res.status(200).json(new ApiResponse(200, { rawLogs: logs, totalLogs: logs.length }, "Logs fetched successfully", true));
 });
 
-// Get attendance summary for a date range
-const getAttendanceSummary = asyncHandler(async (req, res) => {
-  try {
-    const { fromDate, toDate, employeeId } = req.query;
-    
-    if (!fromDate || !toDate) {
-      return res.status(400).json(
-        new ApiResponse(400, null, "FromDate and ToDate are required", false)
-      );
-    }
+export const getAttendanceSummary = asyncHandler(async (req, res) => {
+  const { fromDate, toDate, employeeId } = req.query;
 
-    const startDate = createISTDateFromString(fromDate);
-    const endDate = createISTDateFromString(toDate);
-
-    const matchConditions = {
-      date: {
-        $gte: startDate,
-        $lte: endDate
-      }
-    };
-
-    if (employeeId) {
-      matchConditions.employeeId = employeeId;
-    }
-
-    const attendanceRecords = await Attendance.find(matchConditions)
-      .populate('employeeId', 'employeeId firstName lastName')
-      .sort({ date: 1, 'employeeId.employeeId': 1 });
-
-    // Group by employee
-    const groupedByEmployee = {};
-    attendanceRecords.forEach(record => {
-      const empId = record.employeeId.employeeId;
-      if (!groupedByEmployee[empId]) {
-        groupedByEmployee[empId] = {
-          employee: record.employeeId,
-          attendanceRecords: []
-        };
-      }
-      groupedByEmployee[empId].attendanceRecords.push(record);
-    });
-
-    // Calculate summary statistics
-    const summary = Object.keys(groupedByEmployee).map(empId => {
-      const empData = groupedByEmployee[empId];
-      const records = empData.attendanceRecords;
-      
-      const totalDays = records.length;
-      const presentDays = records.filter(r => r.punchInTime && r.punchOutTime).length;
-      const leaveDays = records.filter(r => r.isLeave).length;
-      const avgAttendancePercentage = totalDays > 0 ? 
-        records.reduce((sum, r) => sum + r.attendancePercentage, 0) / totalDays : 0;
-      
-      return {
-        employee: empData.employee,
-        totalDays,
-        presentDays,
-        leaveDays,
-        absentDays: totalDays - presentDays - leaveDays,
-        avgAttendancePercentage: Math.round(avgAttendancePercentage * 100) / 100,
-        attendanceRecords: records
-      };
-    });
-
-    return res.status(200).json(
-      new ApiResponse(200, {
-        summary,
-        totalEmployees: Object.keys(groupedByEmployee).length,
-        dateRange: { fromDate, toDate }
-      }, "Attendance summary retrieved successfully", true)
-    );
-
-  } catch (error) {
-    console.error("Error getting attendance summary:", error);
-    return res.status(500).json(
-      new ApiResponse(500, null, "Error getting attendance summary", false)
-    );
+  if (!fromDate || !toDate) {
+    return res.status(400).json(new ApiResponse(400, null, "FromDate and ToDate are required", false));
   }
+
+  const startDate = midnightIST(fromDate);
+  const endDate = new Date(midnightIST(toDate).getTime() + 86_400_000 - 1);
+
+  const matchConditions = { date: { $gte: startDate, $lte: endDate } };
+  if (employeeId) matchConditions.employeeId = employeeId;
+
+  const records = await Attendance.find(matchConditions).populate('employeeId', 'employeeId firstName lastName');
+
+  const grouped = {};
+  records.forEach(r => {
+    const empId = r.employeeId.employeeId;
+    if (!grouped[empId]) grouped[empId] = { employee: r.employeeId, totalDays: 0, presentDays: 0, leaveDays: 0, pctSum: 0 };
+    
+    grouped[empId].totalDays++;
+    if (r.isLeave) grouped[empId].leaveDays++;
+    else if (r.punchInTime && r.punchOutTime) grouped[empId].presentDays++;
+    
+    grouped[empId].pctSum += r.attendancePercentage;
+  });
+
+  const summary = Object.values(grouped).map(emp => ({
+    employee: emp.employee,
+    totalDays: emp.totalDays,
+    presentDays: emp.presentDays,
+    leaveDays: emp.leaveDays,
+    absentDays: emp.totalDays - emp.presentDays - emp.leaveDays,
+    avgAttendancePercentage: emp.totalDays > 0 ? Math.round(emp.pctSum / emp.totalDays) : 0
+  }));
+
+  return res.status(200).json(new ApiResponse(200, { summary, totalEmployees: summary.length }, "Summary retrieved", true));
 });
 
-// Manual reconciliation for specific date
-const manualReconciliation = asyncHandler(async (req, res) => {
-  try {
-    const { date } = req.query;
-    
-    if (!date) {
-      return res.status(400).json(
-        new ApiResponse(400, null, "Date is required", false)
-      );
-    }
-
-    const result = await reconcileAttendanceForDate(date);
-
-    if (result.success) {
-      return res.status(200).json(
-        new ApiResponse(200, result, "Manual reconciliation completed successfully", true)
-      );
-    } else {
-      return res.status(500).json(
-        new ApiResponse(500, result, "Manual reconciliation failed", false)
-      );
-    }
-
-  } catch (error) {
-    console.error("Error in manual reconciliation:", error);
-    return res.status(500).json(
-      new ApiResponse(500, null, "Error in manual reconciliation", false)
-    );
-  }
+export const manualReconciliation = asyncHandler(async (req, res) => {
+  req.query.fromDate = req.query.date;
+  req.query.toDate = req.query.date;
+  return processBiometricAttendance(req, res);
 });
-
-export { 
-  fetchBiometricLogs, 
-  processBiometricAttendance, 
-  getAttendanceSummary,
-  manualReconciliation 
-};

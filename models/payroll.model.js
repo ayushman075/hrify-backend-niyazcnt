@@ -6,8 +6,16 @@ const payrollSchema = new mongoose.Schema({
     ref: 'Employee',
     required: true
   },
-  month: {
+  period: {
     type: String,
+    required: true // 'YYYY-MM' for monthly, 'WWYY' for weekly
+  },
+  month: {
+    type: String, // Kept optional, useful for filtering monthly payrolls specifically
+  },
+  type: {
+    type: String,
+    enum: ['Monthly', 'Weekly'],
     required: true
   },
   attendance: {
@@ -17,6 +25,7 @@ const payrollSchema = new mongoose.Schema({
     unpaidLeave: Number,
     absent: Number,
     holidays: Number,
+    lossOfPay: Number, // <-- Added Loss of Pay field
     totalDaysPayable: Number,
     totalDaysNonPayable: Number,
     attendancePercentage: Number
@@ -37,6 +46,10 @@ const payrollSchema = new mongoose.Schema({
     taxes: Number,
     totalDeductions: Number
   },
+  employerContributions: {
+    epf: Number,
+    esi: Number,
+  },
   netSalary: Number,
   status: {
     type: String,
@@ -44,12 +57,13 @@ const payrollSchema = new mongoose.Schema({
     default: 'draft'
   },
   processedAt: Date,
-  paidAt: Date
+  paidAt: Date,
+  comments: String
 }, {
   timestamps: true
 });
 
-// Compound index for efficient queries
-payrollSchema.index({ employee: 1, month: 1 }, { unique: true });
+// Compound index updated to use `period` to support both weekly and monthly safely
+payrollSchema.index({ employee: 1, period: 1 }, { unique: true });
 
 export const Payroll = mongoose.model('Payroll', payrollSchema);
