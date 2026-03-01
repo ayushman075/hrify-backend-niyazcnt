@@ -1,17 +1,16 @@
 import { asyncHandler } from "../utils/AsyncHandler.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
-import moment from "moment";
 import mongoose from "mongoose";
 import Attendance from "../models/attendance.model.js";
 import { Payroll } from "../models/payroll.model.js";
 import { Leave } from "../models/leave.model.js";
 import { User } from "../models/user.model.js";
 import { Employee } from "../models/employee.model.js";
-import { AdvancePayment } from "../models/advancedPayment.model.js"; // Fixed typo in import
+import { AdvancePayment } from "../models/advancedPayment.model.js";
 import { getCache, setCache, removeCachePattern } from "../utils/cache.js";
 
 // ==========================================
-// CONFIGURATION & HELPERS
+// CONFIGURATION & NATIVE IST TIME HELPERS
 // ==========================================
 
 const CACHE_KEY = {
@@ -20,11 +19,53 @@ const CACHE_KEY = {
   HR_DETAIL_ATT: "dash_det_att_",        
   HR_DETAIL_PAY: "dash_det_pay_",
   HR_DETAIL_LEAVE: "dash_det_leave_",
-  SITE_ATTENDANCE: "dash_site_att_"      // New Cache key for site detailed attendance
+  SITE_ATTENDANCE: "dash_site_att_"      // Site detailed attendance
 };
 
-const getLastMonthString = () => moment().subtract(1, "month").format("YYYY-MM");
-const getCurrentMonthString = () => moment().format("YYYY-MM");
+// IST is UTC + 5:30 (330 minutes)
+const IST_OFFSET_MS = 330 * 60 * 1000;
+
+export const getISTStartOfDay = (date = new Date()) => {
+    const d = new Date(new Date(date).getTime() + IST_OFFSET_MS);
+    d.setUTCHours(0, 0, 0, 0);
+    return new Date(d.getTime() - IST_OFFSET_MS);
+};
+
+export const getISTEndOfDay = (date = new Date()) => {
+    const d = new Date(new Date(date).getTime() + IST_OFFSET_MS);
+    d.setUTCHours(23, 59, 59, 999);
+    return new Date(d.getTime() - IST_OFFSET_MS);
+};
+
+export const getISTStartOfMonth = () => {
+    const d = new Date(Date.now() + IST_OFFSET_MS);
+    d.setUTCDate(1);
+    d.setUTCHours(0, 0, 0, 0);
+    return new Date(d.getTime() - IST_OFFSET_MS);
+};
+
+export const getISTEndOfMonth = () => {
+    const d = new Date(Date.now() + IST_OFFSET_MS);
+    d.setUTCMonth(d.getUTCMonth() + 1, 0); 
+    d.setUTCHours(23, 59, 59, 999);
+    return new Date(d.getTime() - IST_OFFSET_MS);
+};
+
+export const getCurrentMonthString = () => {
+    const d = new Date(Date.now() + IST_OFFSET_MS);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+};
+
+export const getLastMonthString = () => {
+    const d = new Date(Date.now() + IST_OFFSET_MS);
+    d.setUTCMonth(d.getUTCMonth() - 1);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
+};
+
+export const formatToYYYYMMDD = (date) => {
+    const d = new Date(new Date(date).getTime() + IST_OFFSET_MS);
+    return `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`;
+};
 
 export const invalidateDashboardCache = async (specificUserId = null) => {
     try {
@@ -51,8 +92,8 @@ const getHRDashboardStats = asyncHandler(async (req, res) => {
 
   const lastMonth = getLastMonthString();
   const currentMonth = getCurrentMonthString();
-  const todayStart = moment().startOf("day").toDate();
-  const todayEnd = moment().endOf("day").toDate();
+  const todayStart = getISTStartOfDay();
+  const todayEnd = getISTEndOfDay();
 
   const [attendanceStats, payrollStats, leaveStats, siteWiseStats] = await Promise.all([
       getAttendanceStats(currentMonth),
@@ -129,8 +170,8 @@ async function getLeaveStats(todayStart, todayEnd) {
     endDate: { $gte: todayStart },
   });
 
-  const currentMonthStart = moment().startOf("month").toDate();
-  const currentMonthEnd = moment().endOf("month").toDate();
+  const currentMonthStart = getISTStartOfMonth();
+  const currentMonthEnd = getISTEndOfMonth();
 
   const [leaveApplicationsThisMonth, acceptedLeaveApplicationsThisMonth] = await Promise.all([
       Leave.countDocuments({ appliedOn: { $gte: currentMonthStart, $lte: currentMonthEnd } }),
@@ -140,7 +181,6 @@ async function getLeaveStats(todayStart, todayEnd) {
   return { employeesOnLeaveToday, leaveApplicationsThisMonth, acceptedLeaveApplicationsThisMonth };
 }
 
-// FIXED: Now relies strictly on today's Attendance records to prevent application-date bugs.
 async function getSiteWiseStats(todayStart, todayEnd) {
     return await Attendance.aggregate([
         { 
@@ -190,43 +230,39 @@ async function getSiteWiseStats(todayStart, todayEnd) {
     ]);
 }
 
-
 // ==========================================
 // NEW: DETAILED SITE ATTENDANCE
 // ==========================================
 
 const getDetailedSiteAttendance = asyncHandler(async (req, res) => {
     const { siteId } = req.params;
-    const queryDate = req.query.date ? moment(req.query.date) : moment();
+    const queryDate = req.query.date ? new Date(req.query.date) : new Date();
     
     if (!siteId) {
         return res.status(400).json(new ApiResponse(400, null, "Site ID is required"));
     }
 
-    const todayStart = queryDate.startOf('day').toDate();
-    const todayEnd = queryDate.endOf('day').toDate();
+    const todayStart = getISTStartOfDay(queryDate);
+    const todayEnd = getISTEndOfDay(queryDate);
+    const dateString = formatToYYYYMMDD(queryDate);
     
-    const cacheKey = `${CACHE_KEY.SITE_ATTENDANCE}${siteId}_${queryDate.format('YYYYMMDD')}`;
+    const cacheKey = `${CACHE_KEY.SITE_ATTENDANCE}${siteId}_${dateString}`;
     const cachedData = await getCache(cacheKey);
     if (cachedData) {
         return res.status(200).json(new ApiResponse(200, cachedData, "Detailed site attendance fetched from Cache"));
     }
 
-    // High-performance single pipeline to fetch employees, their posts/departments, and today's exact status
     const siteAttendanceData = await Employee.aggregate([
-        // 1. Match Active Employees belonging to the Site
         { 
             $match: { 
                 site: new mongoose.Types.ObjectId(siteId), 
                 status: { $in: ['Active', 'Probation', 'Trainee', 'Contractual'] } 
             } 
         },
-        // 2. Lookup Post & Department
         { $lookup: { from: 'posts', localField: 'post', foreignField: '_id', as: 'postDoc' } },
         { $unwind: { path: '$postDoc', preserveNullAndEmptyArrays: true } },
         { $lookup: { from: 'departments', localField: 'postDoc.department', foreignField: '_id', as: 'deptDoc' } },
         { $unwind: { path: '$deptDoc', preserveNullAndEmptyArrays: true } },
-        // 3. Lookup Today's Attendance Record
         {
             $lookup: {
                 from: 'attendances',
@@ -243,7 +279,6 @@ const getDetailedSiteAttendance = asyncHandler(async (req, res) => {
             }
         },
         { $unwind: { path: '$attendance', preserveNullAndEmptyArrays: true } },
-        // 4. Assign Status
         {
             $addFields: {
                 status: {
@@ -258,7 +293,6 @@ const getDetailedSiteAttendance = asyncHandler(async (req, res) => {
                 }
             }
         },
-        // 5. Group by Department and Post First
         {
             $group: {
                 _id: {
@@ -279,7 +313,6 @@ const getDetailedSiteAttendance = asyncHandler(async (req, res) => {
                 }
             }
         },
-        // 6. Group by Department to create the nested arrays
         {
             $group: {
                 _id: { deptId: '$_id.deptId', deptName: '$_id.deptName' },
@@ -295,7 +328,6 @@ const getDetailedSiteAttendance = asyncHandler(async (req, res) => {
                 }
             }
         },
-        // 7. Format Final Output
         {
             $project: {
                 _id: 0,
@@ -311,7 +343,6 @@ const getDetailedSiteAttendance = asyncHandler(async (req, res) => {
 
     return res.status(200).json(new ApiResponse(200, siteAttendanceData, "Detailed site attendance fetched successfully"));
 });
-
 
 // ==========================================
 // DETAILED LIST CONTROLLERS
@@ -382,8 +413,8 @@ const getDetailedPayroll = asyncHandler(async (req, res) => {
 });
 
 const getDetailedLeaves = asyncHandler(async (req, res) => {
-  const currentMonthStart = moment().startOf("month").toDate();
-  const currentMonthEnd = moment().endOf("month").toDate();
+  const currentMonthStart = getISTStartOfMonth();
+  const currentMonthEnd = getISTEndOfMonth();
   const { page = 1, limit = 10, sort = "appliedOn", order = "desc", search = "", status = "" } = req.query;
 
   const cacheKey = `${CACHE_KEY.HR_DETAIL_LEAVE}p${page}_l${limit}_s${sort}_o${order}_q${search}_st${status}`;
@@ -430,8 +461,8 @@ const getEmployeeDashboardStats = asyncHandler(async (req, res) => {
     if (cachedStats) return res.status(200).json(new ApiResponse(200, cachedStats, "Employee dashboard stats fetched from Cache"));
 
     const currentMonth = getCurrentMonthString();
-    const todayStart = moment().startOf("day").toDate();
-    const todayEnd = moment().endOf("day").toDate();
+    const todayStart = getISTStartOfDay();
+    const todayEnd = getISTEndOfDay();
     
     const user = await User.findOne({ userId }).lean();
     if (!user || !user.employeeId) return res.status(404).json(new ApiResponse(404, {}, "User or Employee record not found", false));
