@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Salary Slip</title>
+    <style>
+        @page {
+            size: A4;
+            margin: 0;
+        }
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 15px;
+            line-height: 1.4;
+            color: #333;
+            font-size: 12px;
+            height: 100%;
+            box-sizing: border-box;
+        }
+        .container {
+            min-height: 100%;
+            display: flex;
+            flex-direction: column;
+        }
+        .header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 15px;
+            border-bottom: 2px solid #f0f0f0;
+            margin-bottom: 10px;
+        }
+        .header img {
+            width: 130px;
+        }
+        .company-info {
+            text-align: right;
+            font-size: 11px;
+            line-height: 1.3;
+        }
+        .company-info p {
+            margin: 2px 0;
+        }
+        .content {
+            padding: 15px;
+            flex-grow: 1;
+        }
+        .letter-title {
+            text-align: center;
+            font-size: 20px;
+            font-weight: bold;
+            margin: 10px 0;
+            text-transform: uppercase;
+        }
+        .employee-details {
+            margin-bottom: 10px;
+        }
+        .employee-details table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .employee-details td {
+            padding: 8px;
+            border: 1px solid #ccc;
+        }
+        .employee-details .label {
+            font-weight: bold;
+            background-color: #f8f9fa;
+            width: 20%;
+        }
+        .attendance-section, .salary-section {
+            margin-top: 20px;
+        }
+        .attendance-section h3, .salary-section h3 {
+            margin: 10px 0;
+            font-size: 16px;
+            border-bottom: 1px solid #eee;
+            padding-bottom: 5px;
+        }
+        .salary-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+        .salary-table th {
+            background-color: #f8f9fa;
+            border: 1px solid #ccc;
+            padding: 8px;
+            text-align: left;
+            font-weight: bold;
+            font-size: 12px;
+        }
+        .salary-table td {
+            border: 1px solid #ccc;
+            padding: 8px;
+            font-size: 12px;
+        }
+        .salary-table .amount {
+            text-align: right;
+        }
+        .net-salary {
+            margin-top: 20px;
+            font-weight: bold;
+            font-size: 16px;
+            text-align: right;
+            padding: 10px;
+            background-color: #f8f9fa;
+            border: 1px solid #ccc;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        }
+        .signature-section {
+            margin-top: 40px;
+            display: flex;
+            justify-content: space-between;
+            font-size: 12px;
+        }
+        .signature-section p {
+            margin: 4px 0;
+        }
+        .signature-space {
+            height: 40px;
+        }
+        .footer {
+            margin-top: 10px;
+            text-align: center;
+            font-size: 10px;
+            color: #666;
+            border-top: 1px solid #e0e0e0;
+            padding-top: 10px;
+        }
+        .footer p {
+            margin: 3px 0;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <img src="data:image/png;base64,{{base64Logo}}" alt="Company Logo" class="company-logo">
+            <div class="company-info">
+                <p><strong>{{companyName}}</strong></p>
+                <p>Address: {{companyAddress}}</p>
+                <p>Website: {{companyWebsite}}</p>
+                <p>Contact No: {{companyPhone}}</p>
+                <p>Email: {{companyEmail}}</p>
+                <p>Company ID: {{companyId}}</p>
+            </div>
+        </div>
+
+        <div class="letter-title">Salary Slip</div>
+        
+        <div class="content">
+            <div class="employee-details">
+                <table>
+                    <tr>
+                        <td class="label">Employee Name</td>
+                        <td>{{employeeName}}</td>
+                        <td class="label">Employee ID</td>
+                        <td>{{employeeId}}</td>
+                    </tr>
+                    <tr>
+                        <td class="label">Designation</td>
+                        <td>{{designation}}</td>
+                        <td class="label">Month & Year</td>
+                        <td>{{month}}</td>
+                    </tr>
+                </table>
+            </div>
+
+            <div class="attendance-section">
+                <h3>Attendance Details</h3>
+                <table class="salary-table">
+                    <tr>
+                        <th>Working Days</th>
+                        <th>Present Days</th>
+                        <th>Paid Leave</th>
+                        <th>Unpaid Leave</th>
+                        <th>Absent</th>
+                        <th>Holidays</th>
+                        <th>Total Days Payable</th>
+                    </tr>
+                    <tr>
+                        <td>{{attendance.workingDays}}</td>
+                        <td>{{attendance.presentDays}}</td>
+                        <td>{{attendance.paidLeaveDays}}</td>
+                        <td>{{attendance.unpaidLeave}}</td>
+                        <td>{{attendance.absent}}</td>
+                        <td>{{attendance.holidays}}</td>
+                        <td>{{attendance.totalDaysPayable}}</td>
+                    </tr>
+                </table>
+            </div>
+
+            <div class="salary-section">
+                <h3>Salary Details</h3>
+                <table class="salary-table">
+                    <tr>
+                        <th colspan="2">Earnings</th>
+                        <th colspan="2">Deductions</th>
+                    </tr>
+                    <tr>
+                        <td>Basic Salary</td>
+                        <td class="amount">₹{{earnings.basicSalary}}</td>
+                        <td>EPF (Employee)</td>
+                        <td class="amount">₹{{deductions.epfEmployee}}</td>
+                    </tr>
+                    <tr>
+                        <td>House Rent Allowance</td>
+                        <td class="amount">₹{{earnings.houseRentAllowance}}</td>
+                        <td>ESI (Employee)</td>
+                        <td class="amount">₹{{deductions.esiEmployee}}</td>
+                    </tr>
+                    <tr>
+                        <td>Dearness Allowance</td>
+                        <td class="amount">₹{{earnings.dearnessAllowance}}</td>
+                        <td>Income Tax</td>
+                        <td class="amount">₹{{deductions.taxes}}</td>
+                    </tr>
+                    <tr>
+                        <td>Perquisites</td>
+                        <td class="amount">₹{{earnings.perquisites}}</td>
+                        <td rowspan="4"></td>
+                        <td rowspan="4"></td>
+                    </tr>
+                    <tr>
+                        <td>Other Allowances</td>
+                        <td class="amount">₹{{earnings.others}}</td>
+                    </tr>
+                    <tr>
+                        <td>Bonus</td>
+                        <td class="amount">₹{{earnings.bonus}}</td>
+                    </tr>
+                    <tr>
+                        <td>Variable Pay</td>
+                        <td class="amount">₹{{earnings.variablePay}}</td>
+                    </tr>
+                    <tr>
+                        <td><strong>Gross Salary</strong></td>
+                        <td class="amount"><strong>₹{{earnings.grossSalary}}</strong></td>
+                        <td><strong>Total Deductions</strong></td>
+                        <td class="amount"><strong>₹{{deductions.totalDeductions}}</strong></td>
+                    </tr>
+                </table>
+            </div>
+
+            <div class="net-salary">
+                Net Salary: ₹{{netSalary}} ({{netSalaryInWords}})
+            </div>
+
+            <div class="signature-section">
+                <div class="employee-signature">
+                    <p>Employee Signature</p>
+                    <div class="signature-space"></div>
+                    <p>____________________</p>
+                </div>
+                <div class="employer-signature">
+                    <p>For {{companyName}}</p>
+                    <div class="signature-space"></div>
+                    <p>____________________</p>
+                    <p>Authorized Signatory</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="footer">
+            <p>This is a computer-generated document. No signature is required. Generated on {{generationDate}}. Payment Status: {{status}}</p>
+        </div>
+    </div>
+</body>
+</html>
