@@ -97,7 +97,7 @@ app.use("/api/v1/employeeDocument",documentVaultRouter)
 app.use("/api/v1/biometric",biometricRouter);
 
 
-startAttendanceReconciliationCron()
+//startAttendanceReconciliationCron()
 
 
 // try {
